@@ -5,5 +5,6 @@ CLAUDE.md
 frontend/dist/
 frontend/dist-electron/
 sample_sns.py
-backend/models/best.onnx
+backend/models/*.onnx
 backend/.env
+.env
