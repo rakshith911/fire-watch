@@ -8,3 +8,4 @@ sample_sns.py
 backend/models/*.onnx
 backend/.env
 .env
+backend/mediamtx

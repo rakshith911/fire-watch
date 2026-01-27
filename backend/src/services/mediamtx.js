@@ -1,4 +1,4 @@
-import Docker from "dockerode";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -6,28 +6,33 @@ import pino from "pino";
 import os from "node:os";
 import { cfg } from "../config.js";
 import { generateMediaMTXConfig } from "./mediamtxConfigGenerator.js";
+import { fileURLToPath } from "url";
 
 const log = pino({ name: "mediamtx" });
-const docker = new Docker();
 
-let container = null;
-const CONTAINER_NAME = "mediamtx-firewatch";
-const IMAGE_NAME = process.env.MEDIAMTX_IMAGE || "bluenviron/mediamtx:v1.14.0";
+let mtxProcess = null;
+
+// Get __dirname equivalent in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Path to the backend root (where src is)
+const BACKEND_ROOT = path.resolve(__dirname, "../../");
 
 // ✅ FIX: Use user data directory for config when running in Electron
 function getConfigPath() {
   const isElectron = process.env.ELECTRON === 'true';
-  
+
   if (isElectron) {
     // ✅ Use user's home directory for Electron
     const userDataPath = path.join(os.homedir(), '.firewatch');
-    
+
     // Create directory if it doesn't exist
     if (!fs.existsSync(userDataPath)) {
       fs.mkdirSync(userDataPath, { recursive: true });
       log.info({ path: userDataPath }, "Created FireWatch user data directory");
     }
-    
+
     return path.join(userDataPath, 'mediamtx.yml');
   } else {
     // ✅ Use project directory for normal mode
@@ -36,15 +41,48 @@ function getConfigPath() {
   }
 }
 
+/**
+ * Find the MediaMTX executable
+ */
+function getExecutablePath() {
+  const isWindows = process.platform === "win32";
+
+  // 1. Check override path (from Electron Launcher)
+  if (process.env.MEDIAMTX_DIR_OVERRIDE) {
+    const binaryName = isWindows ? "mediamtx.exe" : "mediamtx";
+    const overridePath = path.join(process.env.MEDIAMTX_DIR_OVERRIDE, binaryName);
+    if (fs.existsSync(overridePath)) {
+      return overridePath;
+    }
+  }
+
+  const binaryName = isWindows ? "mediamtx.exe" : "mediamtx";
+
+  // Look in the backend root directory
+  const localPath = path.join(BACKEND_ROOT, binaryName);
+
+  if (fs.existsSync(localPath)) {
+    return localPath;
+  }
+
+  // Also try looking in current working directory
+  const cwdPath = path.join(process.cwd(), binaryName);
+  if (fs.existsSync(cwdPath)) {
+    return cwdPath;
+  }
+
+  return null;
+}
+
 export async function startMediaMTX(userId = null) {
   // STEP 1: Generate MediaMTX config
   try {
     log.info("Generating MediaMTX configuration from database...");
-    
+
     // ✅ Generate config in accessible location
     const configPath = getConfigPath();
     const result = await generateMediaMTXConfig(configPath, userId);
-    
+
     log.info(
       {
         serverIP: result.serverIP,
@@ -60,175 +98,69 @@ export async function startMediaMTX(userId = null) {
     );
   }
 
-  // STEP 2: Resolve config path
+  // STEP 2: Check if already running
+  if (mtxProcess && !mtxProcess.killed) {
+    log.info("MediaMTX process is already running");
+    return mtxProcess;
+  }
+
+  // Ensure any previous instances are dead
+  await stopMediaMTX();
+
+  // STEP 3: Spawn the process
+  const exePath = getExecutablePath();
   const configPath = getConfigPath();
-  const haveConfig = fs.existsSync(configPath);
 
-  if (!haveConfig) {
-    log.warn({ configPath }, "MediaMTX config not found");
+  if (!exePath) {
+    log.error("❌ MediaMTX executable not found! Please place mediamtx binary in the backend folder.");
+    throw new Error("MediaMTX executable not found");
   }
 
-  // STEP 3: Check if container is already running
-  const existing = await getExistingContainer();
-  if (existing && (await isContainerRunning(existing))) {
-    log.info("MediaMTX container is already running");
-    container = existing;
-    return container;
-  }
-  if (existing) await stopAndRemoveContainer(existing);
+  log.info({ exePath, configPath }, "🚀 Spawning MediaMTX process...");
 
-  await pullImageIfNeeded();
+  const args = [configPath];
 
-  const isLinux = process.platform === "linux";
-  container = await createContainer({ configPath, haveConfig, isLinux });
-  await container.start();
-  log.info({ configPath }, "MediaMTX container started");
+  mtxProcess = spawn(exePath, args, {
+    stdio: ['ignore', 'pipe', 'pipe'], // Ignore stdin, capture stdout/stderr
+    windowsHide: true // Hide the console window on Windows
+  });
+
+  // Handle Logs
+  mtxProcess.stdout.on("data", (data) => {
+    log.info({ mtx: data.toString().trim() });
+  });
+
+  mtxProcess.stderr.on("data", (data) => {
+    log.warn({ mtx_err: data.toString().trim() });
+  });
+
+  mtxProcess.on("close", (code) => {
+    log.info(`MediaMTX process exited with code ${code}`);
+    mtxProcess = null;
+  });
 
   // Wait until HTTP port answers
-  const timeout = Number(process.env.MEDIAMTX_READY_TIMEOUT_MS || 20000);
+  const timeout = Number(process.env.MEDIAMTX_READY_TIMEOUT_MS || 10000);
   await waitForHttp("127.0.0.1", 8888, timeout);
   log.info("MediaMTX HTTP is responsive on :8888");
 
-  // Stream container logs if enabled
-  if (process.env.MEDIAMTX_STREAM_LOGS === "true") {
-    await streamMediaMtxLogs();
-  }
-  return container;
+  return mtxProcess;
 }
 
-// Rest of the file stays the same...
 export async function stopMediaMTX() {
-  const existing = await getExistingContainer();
-  if (!existing) return;
-  await stopAndRemoveContainer(existing);
-  log.info("MediaMTX container stopped");
+  if (mtxProcess) {
+    log.info("🛑 Stopping MediaMTX process...");
+    mtxProcess.kill();
+    mtxProcess = null;
+  }
 }
 
 export async function isMediaMTXRunning() {
-  const existing = await getExistingContainer();
-  return existing ? isContainerRunning(existing) : false;
-}
-
-async function getExistingContainer() {
-  try {
-    const c = docker.getContainer(CONTAINER_NAME);
-    await c.inspect();
-    return c;
-  } catch {
-    return null;
-  }
-}
-
-async function isContainerRunning(c) {
-  try {
-    const info = await c.inspect();
-    return info.State?.Running === true;
-  } catch {
-    return false;
-  }
-}
-
-async function pullImageIfNeeded() {
-  try {
-    await docker.getImage(IMAGE_NAME).inspect();
-    log.info(`MediaMTX image ${IMAGE_NAME} already present locally`);
-    return;
-  } catch {}
-
-  log.info(`Pulling MediaMTX image ${IMAGE_NAME}...`);
-  return new Promise((resolve, reject) => {
-    docker.pull(IMAGE_NAME, (err, stream) => {
-      if (err) return reject(err);
-      docker.modem.followProgress(
-        stream,
-        (err2) => (err2 ? reject(err2) : resolve()),
-        (event) => {
-          if (event?.status) log.info(event.status);
-        }
-      );
-    });
-  });
-}
-
-function makePortMaps() {
-  const exposed = {
-    "8888/tcp": {},
-    "8889/tcp": {},
-    "8554/tcp": {},
-    "8189/udp": {},
-    "8189/tcp": {},
-  };
-  const bindings = {
-    "8888/tcp": [{ HostPort: "8888" }],
-    "8889/tcp": [{ HostPort: "8889" }],
-    "8554/tcp": [{ HostPort: "8554" }],
-    "8189/udp": [{ HostPort: "8189" }],
-    "8189/tcp": [{ HostPort: "8189" }],
-  };
-  return { exposed, bindings };
-}
-
-async function createContainer({ configPath, haveConfig, isLinux }) {
-  const binds = [];
-  if (haveConfig) binds.push(`${configPath}:/mediamtx.yml:ro`);
-
-  if (process.env.MEDIAMTX_RECORDINGS_DIR) {
-    binds.push(`${process.env.MEDIAMTX_RECORDINGS_DIR}:/recordings`);
-  }
-
-  if (isLinux && process.env.MEDIAMTX_NETWORK_MODE !== "bridge") {
-    return docker.createContainer({
-      name: CONTAINER_NAME,
-      Image: IMAGE_NAME,
-      Cmd: haveConfig ? ["/mediamtx.yml"] : [],
-      HostConfig: {
-        NetworkMode: "host",
-        RestartPolicy: { Name: "unless-stopped" },
-        Binds: binds,
-      },
-    });
-  }
-
-  const { exposed, bindings } = makePortMaps();
-  return docker.createContainer({
-    name: CONTAINER_NAME,
-    Image: IMAGE_NAME,
-    ExposedPorts: exposed,
-    Cmd: haveConfig ? ["/mediamtx.yml"] : [],
-    HostConfig: {
-      RestartPolicy: { Name: "unless-stopped" },
-      Binds: binds,
-      PortBindings: bindings,
-    },
-  });
-}
-
-async function stopAndRemoveContainer(c) {
-  try {
-    await c.stop({ t: 5 });
-  } catch (e) {
-    log.warn(`stop: ${e.message}`);
-  }
-  try {
-    await c.remove({ force: true });
-  } catch (e) {
-    log.warn(`remove: ${e.message}`);
-  }
+  return mtxProcess !== null && !mtxProcess.killed;
 }
 
 export async function streamMediaMtxLogs() {
-  if (!container) return;
-  try {
-    const logStream = await container.logs({
-      follow: true,
-      stdout: true,
-      stderr: true,
-      tail: 50,
-    });
-    logStream.on("data", (chunk) => log.info({ mtx: chunk.toString().trim() }));
-  } catch (error) {
-    log.error({ error: error.message }, "Failed to stream MediaMTX logs");
-  }
+  // Logs were already piped in startMediaMTX
 }
 
 async function waitForHttp(host, port, timeoutMs = 10000) {

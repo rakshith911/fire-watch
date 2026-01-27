@@ -314,9 +314,8 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                   All
                 </button>
                 <button
-                  className={`filter-btn ${
-                    filter === "streaming" ? "active" : ""
-                  }`}
+                  className={`filter-btn ${filter === "streaming" ? "active" : ""
+                    }`}
                   onClick={() => handleFilterChange("streaming")}
                 >
                   Streaming
@@ -389,8 +388,8 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                     {searchQuery
                       ? `No cameras match "${searchQuery}"`
                       : filter !== "all"
-                      ? `No cameras match the "${filter}" filter`
-                      : "No cameras available"}
+                        ? `No cameras match the "${filter}" filter`
+                        : "No cameras available"}
                   </p>
                   {(searchQuery || filter !== "all") && (
                     <button
@@ -423,9 +422,8 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                       return (
                         <div
                           key={c.id}
-                          className={`modern-table-row ${
-                            isAnimatingOut ? "deleting" : ""
-                          }`}
+                          className={`modern-table-row ${isAnimatingOut ? "deleting" : ""
+                            }`}
                         >
                           <div className="table-cell name-col">
                             <span className="cell-label">Name</span>
@@ -522,9 +520,8 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                               <select
                                 className={`detection-select ${(
                                   c.detection || "LOCAL"
-                                ).toLowerCase()} ${
-                                  togglingDetection.has(c.id) ? "updating" : ""
-                                }`}
+                                ).toLowerCase()} ${togglingDetection.has(c.id) ? "updating" : ""
+                                  }`}
                                 value={c.detection || "LOCAL"}
                                 onChange={(e) =>
                                   handleDetectionChange(c.id, e.target.value)
@@ -544,9 +541,8 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                             <span className="cell-label">AI Type</span>
                             <div className="aitype-select-wrapper">
                               <select
-                                className={`aitype-select ${
-                                  updatingAiType.has(c.id) ? "updating" : ""
-                                }`}
+                                className={`aitype-select ${updatingAiType.has(c.id) ? "updating" : ""
+                                  }`}
                                 value={c.aiType || "FIRE"}
                                 onChange={(e) =>
                                   handleAiTypeChange(c.id, e.target.value)
@@ -554,7 +550,7 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                                 disabled={updatingAiType.has(c.id)}
                               >
                                 <option value="FIRE">🔥 Fire Detect</option>
-                                <option value="INTRUSION">🚶 Intrusion Detect</option>
+                                <option value="THEFT">🕵️ Theft Detection</option>
                                 <option value="CROWD_DENSITY">👥 Crowd Detect</option>
                                 <option value="ANONYMIZATION">🕶️ Blur Faces</option>
                                 <option value="WEAPON">🔫 Weapon Detect</option>
@@ -565,9 +561,8 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                             <span className="cell-label">Actions</span>
                             <div className="action-buttons">
                               <button
-                                className={`action-btn ${
-                                  isEditing ? "save-btn" : "edit-btn"
-                                }`}
+                                className={`action-btn ${isEditing ? "save-btn" : "edit-btn"
+                                  }`}
                                 onClick={() => handleEditClick(c)}
                                 title={
                                   isEditing ? "Save changes" : "Edit camera"

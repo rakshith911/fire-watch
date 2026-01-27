@@ -253,6 +253,7 @@ cameras.put("/:id", async (req, res) => {
         "CROWD_DENSITY",
         "ANONYMIZATION",
         "WEAPON",
+        "THEFT",
       ];
       if (!validAiTypes.includes(req.body.aiType)) {
         return res.status(400).json({

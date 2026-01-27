@@ -9,6 +9,14 @@ function Router() {
 }
 
 export default function App() {
+  React.useEffect(() => {
+    if (window.electronAPI) {
+      window.electronAPI.getLogPath().then((path) => {
+        console.log("📂 BACKEND LOGS ARE HERE:", path);
+      });
+    }
+  }, []);
+
   return (
     <AuthProvider>
       <Router />

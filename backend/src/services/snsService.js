@@ -40,14 +40,26 @@ export async function sendFireAlert(
     // ✅ User is pre-subscribed via standalone script
     // ✅ SNS filtering ensures only the target userId receives the notification
 
+    // Determine Alert Type and Emoji
+    const type = detectionResult.detectionType || "FIRE";
+    let emoji = "🔥";
+    let title = "Fire Alert";
+
+    if (type === "WEAPON") {
+      emoji = "🔫";
+      title = "Weapon Alert";
+    } else if (type === "THEFT") {
+      emoji = "🕵️";
+      title = "Theft Detection Alert";
+    }
+
     const message = `
-  🔥 Fire detected from ${cameraName} (${cameraId})!
+  ${emoji} ${title} from ${cameraName} (${cameraId})!
 
   Detection Details:
+  - Type: ${type}
   - Camera: ${cameraName}
   - Confidence: ${detectionResult.confidence?.toFixed(2) || "N/A"}
-  - Fire Count: ${detectionResult.fireCount || 0}
-  - Smoke Count: ${detectionResult.smokeCount || 0}
   - Timestamp: ${new Date().toISOString()}
 
   ${imageUrl ? `Image: ${imageUrl}` : ""}
@@ -58,7 +70,7 @@ export async function sendFireAlert(
 
     const command = new PublishCommand({
       TopicArn: SNS_TOPIC_ARN,
-      Subject: `🔥 Fire Alert - ${cameraName}`,
+      Subject: `${emoji} ${title} - ${cameraName}`,
       Message: message,
       MessageAttributes: {
         userId: {

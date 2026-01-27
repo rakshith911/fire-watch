@@ -1,6 +1,7 @@
 import pino from "pino";
 import { detectFire, buildCameraUrl } from "./localDetector.js";
 import { detectWeapon } from "./localWeaponDetector.js";
+import { detectTheft } from "./localTheftDetector.js";
 import livenessValidator from "./livenessValidator.js";
 import {
   startCameraStream,
@@ -198,13 +199,15 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
       let result;
       if (detectionType === "WEAPON") {
         result = await detectWeapon(cameraUrl, camera.name);
+      } else if (detectionType === "THEFT") {
+        result = await detectTheft(cameraUrl, camera.name);
       } else {
         // Default to FIRE (LOCAL)
         result = await detectFire(cameraUrl, camera.name);
       }
 
       // Normalize result structure
-      const isDetected = result.isFire || result.isWeapon;
+      const isDetected = result.isFire || result.isWeapon || result.isTheft;
 
       if (isDetected) {
         frames.push({
@@ -218,7 +221,7 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
         });
 
         const detectedLabel = result.boxes.length > 0 ? result.boxes[0][4] : "Object";
-        const prefix = detectionType === "WEAPON" ? "🔫 WEAPON" : "🔥 LOCAL";
+        const prefix = detectionType === "WEAPON" ? "🔫 WEAPON" : detectionType === "THEFT" ? "🕵️ THEFT" : "🔥 LOCAL";
 
         log.info(
           {
@@ -231,7 +234,7 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
           `${prefix} Frame ${i + 1}/${FRAMES_PER_CHECK}: ${detectedLabel} detected`
         );
       } else {
-        const prefix = detectionType === "WEAPON" ? "✅ WEAPON" : "✅ LOCAL";
+        const prefix = detectionType === "WEAPON" ? "✅ WEAPON" : detectionType === "THEFT" ? "✅ THEFT" : "✅ LOCAL";
         log.info(
           {
             id: camera.id,
@@ -526,6 +529,30 @@ async function startQueueLoop() {
             } else {
               log.warn("⚠️ WEAPON: Liveness Check FAILED (2D/Flat Image) - Ignoring");
             }
+          }
+        } else if (detectionType === "THEFT") {
+          // 🕵️ THEFT: Check Motion (IoU) AND Depth (Real Person vs Poster)
+          iouAnalysis = analyzeBoxes(frames);
+
+          if (!iouAnalysis.isStatic) {
+            // It's moving, now check if it's a flat video playback/poster
+            const lastFrame = frames[frames.length - 1];
+            const bbox = lastFrame.boxes[0];
+
+            // Reuse the 3D depth check (works for any object, not just weapons)
+            const is3D = await livenessValidator.isWeapon3D(lastFrame.frameBuffer, bbox);
+
+            if (is3D) {
+              isRealDetection = true;
+              log.info("🕵️ THEFT: Liveness Check PASSED (Moving + 3D)");
+            } else {
+              log.warn("⚠️ THEFT: Liveness Check FAILED (Moving but 2D/Flat - Video?) - Ignoring");
+            }
+          } else {
+            log.warn(
+              { ...iouAnalysis },
+              `⚠️ STATIC THEFT DETECTED (IoU ${iouAnalysis.avgIoU} > ${BOX_IOU_THRESHOLD}) - Likely poster`
+            );
           }
         } else {
           // 🔥 FIRE: Perform IoU check AND Pixel Motion check

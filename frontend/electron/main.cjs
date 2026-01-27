@@ -95,6 +95,12 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, exec } = require("child_process");
 const util = require("util");
+const { S3Client, GetObjectCommand, ListObjectsV2Command } = require("@aws-sdk/client-s3");
+const { Upload } = require("@aws-sdk/lib-storage"); // Not used for download but good to have
+const stream = require("stream");
+const { promisify } = require("util");
+const pipeline = promisify(stream.pipeline);
+
 const execPromise = util.promisify(exec);
 
 // ✅ Logging setup
@@ -134,78 +140,181 @@ function openLogsFolder() {
 }
 
 let mainWindow;
+let splashWindow;
 let backendProcess;
 
-// ✅ FIX: Proper dev detection
 const isDev = !app.isPackaged;
+
+// ✅ LOAD ENV VARS for S3
+if (isDev) {
+  require("dotenv").config({ path: path.join(__dirname, "../../backend/.env") });
+} else {
+  // In production, .env is copied to resources/backend/.env
+  require("dotenv").config({ path: path.join(process.resourcesPath, "backend/.env") });
+}
+
+// ✅ RESOURCE PATHS
+const userDataPath = app.getPath("userData");
+const modelsPath = path.join(userDataPath, "models");
+const backendRootPath = path.join(userDataPath, "backend_bin"); // For binaries like mediamtx
+ensureDir(modelsPath);
+ensureDir(backendRootPath);
+
+// ✅ AWS CONFIG
+// NOTE: Ideally these should be baked in or fetched securely. 
+// For this verifying phase, we assume env vars or hardcoded defaults if safe.
+// Since this is client-side, using read-only credentials or signed URLs is better.
+// For now, we will use the ENV vars if available (dev) or require them.
+// WARNING: Bundling admin keys in the app is unsafe. 
+// User should probably use public bucket or signed URLs. 
+// Assuming public bucket or env vars for now as per previous context.
+const S3_BUCKET = "firewatch-models";
+const AWS_REGION = "us-east-1";
+
+// Create S3 Client (Anonymous if bucket is public, or use embedded Creds - careful!)
+// For the purpose of this demo, we assume the bucket is public-read OR variables are present.
+// If deployment, we should bundle a specific read-only access key.
+const s3 = new S3Client({
+  region: AWS_REGION,
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID, // Needs to be injected in build or handled
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+  }
+});
 
 mlog("🔍 isDev:", isDev);
 mlog("🔍 app.isPackaged:", app.isPackaged);
+mlog("🔍 UserData Path:", userDataPath);
 
-// ✅ FIX: Build proper PATH with common binary locations
-function getFixPath() {
-  const systemPaths = [
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-    "/opt/homebrew/bin",
-    "/opt/local/bin",
+// ✅ CHECK RESOURCES
+async function checkResources() {
+  const REQUIRED_FILES = [
+    "best.onnx",
+    "yolov11n_bestFire.onnx",
+    "theft.onnx",
+    "weapons.onnx",
+    "depth_anything_v2_small.onnx"
   ];
-  const currentPath = process.env.PATH || "";
-  return [...systemPaths, ...currentPath.split(path.delimiter)]
-    .filter((item, index, self) => item && self.indexOf(item) === index)
-    .join(path.delimiter);
-}
 
-async function checkDocker() {
-  const fixedPath = getFixPath();
-  mlog("Checking Docker with PATH:", fixedPath);
+  // Also check for mediamtx binary
+  const binaryName = process.platform === "win32" ? "mediamtx.exe" : "mediamtx";
 
-  try {
-    await execPromise("docker --version", { env: { ...process.env, PATH: fixedPath } });
-    try {
-      await execPromise("docker info", { env: { ...process.env, PATH: fixedPath } });
-      return "running";
-    } catch {
-      return "not_running";
+  const missing = [];
+
+  // Check models
+  for (const file of REQUIRED_FILES) {
+    if (!fs.existsSync(path.join(modelsPath, file))) {
+      missing.push({ type: "model", name: file });
     }
-  } catch (e) {
-    mlog("Docker check failed:", e.message);
-    return "not_installed";
   }
+
+  // Check binary
+  if (!fs.existsSync(path.join(backendRootPath, binaryName))) {
+    missing.push({ type: "binary", name: binaryName });
+  }
+
+  return missing;
 }
 
-async function startDocker() {
-  const fixedPath = getFixPath();
-  mlog("Attempting to start Docker...");
-  if (process.platform === "darwin") {
-    await execPromise("open -a Docker", { env: { ...process.env, PATH: fixedPath } });
-  } else if (process.platform === "win32") {
-    const dockerPath = "C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe";
+// ✅ DOWNLOAD RESOURCES
+async function downloadResources(missingFiles) {
+  mlog("⬇️ Starting download for:", missingFiles.map(f => f.name));
+
+  createSplashWindow();
+
+  let totalFiles = missingFiles.length;
+  let current = 0;
+
+  for (const file of missingFiles) {
+    const targetDir = file.type === "model" ? modelsPath : backendRootPath;
+    const targetPath = path.join(targetDir, file.name);
+
+    // Update Splash UI
+    if (splashWindow && !splashWindow.isDestroyed()) {
+      splashWindow.webContents.send("download-progress", {
+        filename: file.name,
+        current: current + 1,
+        total: totalFiles,
+        percent: Math.round((current / totalFiles) * 100)
+      });
+    }
+
     try {
-      // Use 'start' to launch without waiting for the process to exit
-      await execPromise(`start "" "${dockerPath}"`, { env: { ...process.env, PATH: fixedPath } });
+      // 1. Get from S3
+      // NOTE: If bucket is public, we can just use https.get
+      // Using SDK for robustness
+      const command = new GetObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: file.name // Assuming keys match filenames exactly at root
+      });
+
+      const response = await s3.send(command);
+
+      // 2. Stream to file
+      await pipeline(response.Body, fs.createWriteStream(targetPath));
+
+      // 3. Make executable if binary
+      if (file.type === "binary" && process.platform !== "win32") {
+        fs.chmodSync(targetPath, "755");
+      }
+
+      mlog(`✅ Downloaded: ${file.name}`);
+      current++;
+
     } catch (e) {
-      mlog("Failed to start via full path, trying generic entry", e);
-      // Fallback
-      await execPromise('start "" "Docker Desktop"', { env: { ...process.env, PATH: fixedPath } });
+      mlog(`❌ Failed to download ${file.name}:`, e.message);
+      dialog.showErrorBox("Download Error", `Failed to download ${file.name}. Please check your internet connection.`);
+      app.quit();
+      return false; // Stop
     }
-  } else {
-    throw new Error("Unsupported platform for auto-starting Docker");
   }
+
+  if (splashWindow && !splashWindow.isDestroyed()) {
+    splashWindow.close();
+  }
+  return true;
 }
 
-async function waitForDocker() {
-  let retries = 60; // Wait up to 60 seconds
-  while (retries > 0) {
-    const status = await checkDocker();
-    if (status === "running") return;
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    retries--;
-  }
-  throw new Error("Docker failed to start in time");
+function createSplashWindow() {
+  splashWindow = new BrowserWindow({
+    width: 500,
+    height: 300,
+    frame: false,
+    alwaysOnTop: true,
+    transparent: true,
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false // Simple splash screen
+    }
+  });
+
+  const splashHtml = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body { background: #1a1a1a; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; border: 2px solid #333; border-radius: 10px; }
+            .bar { width: 80%; height: 10px; background: #333; margin-top: 20px; border-radius: 5px; overflow: hidden; }
+            .fill { width: 0%; height: 100%; background: #007bff; transition: width 0.3s; }
+            .status { margin-top: 10px; font-size: 14px; color: #aaa; }
+        </style>
+    </head>
+    <body>
+        <h2>FireAI Setup</h2>
+        <div class="status" id="text">Checking resources...</div>
+        <div class="bar"><div class="fill" id="fill"></div></div>
+        <script>
+            const { ipcRenderer } = require('electron');
+            ipcRenderer.on('download-progress', (event, data) => {
+                document.getElementById('text').innerText = 'Downloading ' + data.filename + ' (' + data.current + '/' + data.total + ')';
+                document.getElementById('fill').style.width = data.percent + '%';
+            });
+        </script>
+    </body>
+    </html>
+  `;
+
+  splashWindow.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(splashHtml));
 }
 
 function createWindow() {
@@ -234,7 +343,7 @@ function createWindow() {
     mlog("🔍 PRODUCTION MODE: Loading file:", indexPath);
     mainWindow.loadFile(indexPath);
 
-    // ✅ Open DevTools for debugging (remove this later)
+    // ✅ DEBUG: Open DevTools in production to help user debug
     mainWindow.webContents.openDevTools();
   }
 
@@ -257,15 +366,15 @@ function createWindow() {
 }
 
 function startBackend() {
-  const backendPath = isDev
+  const backendSrcPath = isDev
     ? path.join(__dirname, "../../backend")
     : path.join(process.resourcesPath, "backend");
 
   const command = isDev ? "npm" : process.execPath;
-  const serverEntry = path.join(backendPath, "src", "server.js");
+  const serverEntry = path.join(backendSrcPath, "src", "server.js");
   const args = isDev ? ["run", "dev"] : [serverEntry];
 
-  mlog("🔍 Starting backend from:", backendPath);
+  mlog("🔍 Starting backend from:", backendSrcPath);
   mlog("🔍 Command:", command, args.join(" "));
 
   // ✅ FIX: Build proper PATH with common binary locations
@@ -282,18 +391,37 @@ function startBackend() {
     .filter(Boolean)
     .join(":");
 
+  // ✅ INJECT USER DATA PATHS INTO BACKEND
+  // This tells the backend where to find the dynamic models/binary
+  const env = {
+    ...process.env,
+    PATH: newPath,
+    NODE_ENV: isDev ? "development" : "production",
+    ELECTRON: "true",
+    ELECTRON_RUN_AS_NODE: "1",
+    PORT: "4000",
+    // DIRECTORY OVERRIDES
+    MODELS_DIR_OVERRIDE: modelsPath,
+    MEDIAMTX_DIR_OVERRIDE: backendRootPath
+  };
+
+  // ✅ CLEANUP: Kill any zombie process on port 4000 before starting
+  try {
+    if (process.platform !== "win32") {
+      mlog("🧹 Cleaning up port 4000...");
+      exec("lsof -ti :4000 | xargs kill -9", (err) => {
+        if (!err) mlog("✅ Killed zombie process on port 4000");
+      });
+    }
+  } catch (e) {
+    mlog("Clean up warning:", e.message);
+  }
+
   backendProcess = spawn(command, args, {
-    cwd: backendPath,
+    cwd: backendSrcPath,
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
-    env: {
-      ...process.env,
-      PATH: newPath, // ✅ This gives backend access to system ffmpeg
-      NODE_ENV: isDev ? "development" : "production",
-      ELECTRON: "true",
-      ELECTRON_RUN_AS_NODE: "1",
-      PORT: "4000",
-    },
+    env: env,
   });
 
   // Pipe backend output to logs/backend.log
@@ -320,56 +448,34 @@ function startBackend() {
   });
 
   mlog("Backend started. Logs:", LOG);
-  mlog("Backend PATH:", newPath);
 }
 
 app.whenReady().then(async () => {
-  mlog("Checking Docker status...");
-  const dockerStatus = await checkDocker();
-  mlog("Docker status:", dockerStatus);
-
-  if (dockerStatus === "not_installed") {
-    const { response } = await dialog.showMessageBox({
-      type: "error",
-      title: "Docker Not Found",
-      message:
-        "Docker is required to run this application. Please install Docker and try again.",
-      buttons: ["Install Docker", "Quit"],
-      defaultId: 0,
-    });
-
-    if (response === 0) {
-      shell.openExternal("https://www.docker.com/products/docker-desktop/");
-    }
-    app.quit();
-    return;
+  // 1. Check & Download Resources
+  const missing = await checkResources();
+  if (missing.length > 0) {
+    mlog("⚠️ Missing resources:", missing);
+    const success = await downloadResources(missing);
+    if (!success) return; // Exit if failed
+  } else {
+    mlog("✅ All resources present.");
   }
 
-  if (dockerStatus === "not_running") {
-    mlog("Docker is installed but not running. Attempting to start...");
-    // Optional: Show a splash screen or loading window here
-    try {
-      await startDocker();
-      mlog("Waiting for Docker to be ready...");
-      await waitForDocker();
-      mlog("Docker started successfully.");
-    } catch (e) {
-      mlog("Failed to start Docker:", e);
-      dialog.showErrorBox(
-        "Docker Error",
-        "Failed to start Docker. Please start Docker manually and restart the app."
-      );
-      app.quit();
-      return;
-    }
-  }
-
+  // 2. Start App
   createWindow();
   startBackend();
+
+  // ✅ Log Logs location to console for user debugging
+  mlog("📂 Logs Directory:", LOG.dir);
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       createWindow();
+    }
+    // ✅ Check if backend is running (fix for MacOS dock click)
+    if (!backendProcess) {
+      mlog("Re-starting backend on activate...");
+      startBackend();
     }
   });
 });
@@ -392,4 +498,8 @@ app.on("before-quit", () => {
 // Handle backend communication
 ipcMain.handle("get-backend-status", async () => {
   return { running: !!backendProcess };
+});
+
+ipcMain.handle("get-log-path", async () => {
+  return LOG.dir;
 });

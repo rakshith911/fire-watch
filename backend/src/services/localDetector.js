@@ -16,7 +16,12 @@ let sessionPromise = null;
 
 function getSession() {
   if (!sessionPromise) {
-    const modelPath = path.resolve(__dirname, "../../models/best.onnx");
+    let modelPath;
+    if (process.env.MODELS_DIR_OVERRIDE) {
+      modelPath = path.join(process.env.MODELS_DIR_OVERRIDE, "best.onnx");
+    } else {
+      modelPath = path.resolve(__dirname, "../../models/best.onnx");
+    }
     log.info({ modelPath }, "Loading Fire ONNX model...");
 
     sessionPromise = ort.InferenceSession.create(modelPath, {
