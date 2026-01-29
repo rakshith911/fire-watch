@@ -50,7 +50,6 @@ function grabFrameOnce(srcUrl) {
         if (isRtsp) {
             args.push(
                 "-rtsp_transport", "tcp",
-                // Standard args, no aggressive timeouts to avoid premature failure
                 "-analyzeduration", "1000000",
                 "-probesize", "1000000"
             );
@@ -73,11 +72,22 @@ function grabFrameOnce(srcUrl) {
 }
 
 // -------------------------------------------------------------------
-// 🔄 Image Preprocessing (Canvas → Sharp)
+// 🔄 Image Preprocessing (FIXED: returns original dimensions + letterbox info)
 // -------------------------------------------------------------------
 async function prepareInput(jpegBuffer, modelInputSize = 640) {
     try {
-        const { data, info } = await sharp(jpegBuffer)
+        const metadata = await sharp(jpegBuffer).metadata();
+        const origW = metadata.width;
+        const origH = metadata.height;
+
+        // Calculate letterbox parameters
+        const scale = Math.min(modelInputSize / origW, modelInputSize / origH);
+        const newW = Math.round(origW * scale);
+        const newH = Math.round(origH * scale);
+        const padX = (modelInputSize - newW) / 2;  // Left padding
+        const padY = (modelInputSize - newH) / 2;  // Top padding
+
+        const { data } = await sharp(jpegBuffer)
             .resize(modelInputSize, modelInputSize, {
                 fit: "contain",
                 background: { r: 114, g: 114, b: 114 }
@@ -88,7 +98,6 @@ async function prepareInput(jpegBuffer, modelInputSize = 640) {
         const N = modelInputSize * modelInputSize;
         const arr = new Float32Array(N * 3);
 
-        // Standard normalization (0-1)
         let r = 0, g = N, b = 2 * N;
         for (let i = 0; i < data.length; i += 3) {
             arr[r++] = data[i] / 255.0;
@@ -96,7 +105,14 @@ async function prepareInput(jpegBuffer, modelInputSize = 640) {
             arr[b++] = data[i + 2] / 255.0;
         }
 
-        return arr;
+        return {
+            tensor: arr,
+            originalWidth: origW,
+            originalHeight: origH,
+            scale,      // The scale factor used
+            padX,       // Horizontal padding (left)
+            padY        // Vertical padding (top)
+        };
     } catch (e) {
         log.error({ error: e.message }, "Failed to preprocess image");
         throw e;
@@ -110,14 +126,12 @@ async function runInference(inputTensor) {
     try {
         const session = await getSession();
 
-        // RT-DETR usually expects [1, 3, 640, 640]
         const tensor = new ort.Tensor(
             "float32",
             inputTensor,
             [1, 3, 640, 640]
         );
 
-        // Run inference
         const inputName = session.inputNames[0];
         const feeds = {};
         feeds[inputName] = tensor;
@@ -131,128 +145,108 @@ async function runInference(inputTensor) {
 }
 
 // -------------------------------------------------------------------
-// 📊 Process RT-DETR Output
+// 📊 Process RT-DETR Output (FIXED: correct format + letterbox compensation)
 // -------------------------------------------------------------------
-function processOutput(outputs, imgW = 640, imgH = 640) {
+function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY) {
     let boxes = [];
-
-    // Debug output keys
     const keys = Object.keys(outputs);
 
-    let rawBoxes = null;
-    let rawScores = null;
+    // RT-DETR outputs single tensor [1, 300, 6]
     let combined = null;
-
-    if (keys.includes("boxes") && keys.includes("scores")) {
-        rawBoxes = outputs["boxes"].data;
-        rawScores = outputs["scores"].data;
-    } else if (keys.length === 1) {
+    if (keys.length === 1) {
         combined = outputs[keys[0]].data;
     } else {
-        log.warn({ keys }, "Unknown output format, trying to parse...");
+        log.warn({ keys }, "Unexpected output format");
+        return { boxes: [], detected: false };
     }
 
-    const numQueries = 300; // Standard RT-DETR query count
-    const numClasses = 2; // Knife, Pistol
-    const probThreshold = 0.65; // Increased to reduce false positives
+    const numQueries = 300;
+    const stride = 6;  // RT-DETR format: [x1, y1, x2, y2, conf, class_id]
+    const probThreshold = 0.5;  // Lowered from 0.65 for testing
 
-    // Helper to get box coordinates
-    const getBox = (i) => {
-        if (rawBoxes) {
-            // rawBoxes is [1, 300, 4] flattened
-            const offset = i * 4;
-            return [
-                rawBoxes[offset],
-                rawBoxes[offset + 1],
-                rawBoxes[offset + 2],
-                rawBoxes[offset + 3]
-            ];
-        } else if (combined) {
-            // combined is [1, 300, 4+classes] flattened
-            // stride = 4 + numClasses
-            const stride = 4 + numClasses;
-            const offset = i * stride;
-            return [
-                combined[offset],
-                combined[offset + 1],
-                combined[offset + 2],
-                combined[offset + 3]
-            ];
-        }
-        return [0, 0, 0, 0];
-    };
+    // Verify data length
+    const expectedLength = numQueries * stride;
+    if (combined.length !== expectedLength) {
+        log.warn({
+            expected: expectedLength,
+            actual: combined.length,
+            possibleFormat: `[1, ${combined.length / 6}, 6] or other`
+        }, "Unexpected data length - model output may differ");
+    }
 
-    // Helper to get max score and class
-    const getScore = (i) => {
-        let maxScore = 0;
-        let maxClass = -1;
-
-        if (rawScores) {
-            // rawScores is [1, 300, numClasses] flattened
-            const offset = i * numClasses;
-            for (let c = 0; c < numClasses; c++) {
-                const s = rawScores[offset + c];
-                if (s > maxScore) {
-                    maxScore = s;
-                    maxClass = c;
-                }
-            }
-        } else if (combined) {
-            // combined is [1, 300, 4+classes] flattened
-            const stride = 4 + numClasses;
-            const offset = i * stride + 4; // Skip 4 box coords
-            for (let c = 0; c < numClasses; c++) {
-                const s = combined[offset + c];
-                if (s > maxScore) {
-                    maxScore = s;
-                    maxClass = c;
-                }
-            }
-        }
-        return { maxScore, maxClass };
-    };
-
-    // DEBUG: Log top 5 scores regardless of threshold
+    // DEBUG: Log top 5 scores
     const allScores = [];
     for (let i = 0; i < numQueries; i++) {
-        const { maxScore, maxClass } = getScore(i);
-        allScores.push({ score: maxScore, class: maxClass });
+        const offset = i * stride;
+        if (offset + 5 >= combined.length) break;
+
+        const conf = combined[offset + 4];
+        const classId = Math.round(combined[offset + 5]);
+        allScores.push({
+            score: conf,
+            class: classId,
+            index: i,
+            rawBox: [
+                combined[offset].toFixed(1),
+                combined[offset + 1].toFixed(1),
+                combined[offset + 2].toFixed(1),
+                combined[offset + 3].toFixed(1)
+            ]
+        });
     }
     allScores.sort((a, b) => b.score - a.score);
+
     const top5 = allScores.slice(0, 5).map(s => ({
         score: s.score.toFixed(4),
-        label: ["Knife", "Pistol"][s.class] || "Unknown"
+        label: ["Knife", "Pistol"][s.class] ?? `Unknown(${s.class})`,
+        classIndex: s.class,
+        rawBox: s.rawBox
     }));
-    log.info({ top5 }, "🔫 WEAPON: Top 5 Raw Scores");
+    log.info({ top5, letterbox: { scale, padX, padY } }, "🔫 WEAPON: Top 5 Raw Scores (RT-DETR format: x1,y1,x2,y2,conf,cls)");
 
     for (let i = 0; i < numQueries; i++) {
-        const { maxScore, maxClass } = getScore(i);
+        const offset = i * stride;
+        if (offset + 5 >= combined.length) break;
 
-        if (maxScore < probThreshold) continue;
+        // RT-DETR format: [x1, y1, x2, y2, confidence, class_id]
+        // Coordinates are ABSOLUTE in 640x640 space (includes letterbox padding)
+        const x1_640 = combined[offset + 0];
+        const y1_640 = combined[offset + 1];
+        const x2_640 = combined[offset + 2];
+        const y2_640 = combined[offset + 3];
+        const confidence = combined[offset + 4];
+        const classId = Math.round(combined[offset + 5]);
 
-        const [cx, cy, w, h] = getBox(i);
+        if (confidence < probThreshold) continue;
+        if (classId < 0 || classId > 1) continue;
 
-        // Convert cx, cy, w, h (normalized 0-1) to x1, y1, x2, y2 (pixel coords)
-        const x1 = (cx - w / 2) * imgW;
-        const y1 = (cy - h / 2) * imgH;
-        const x2 = (cx + w / 2) * imgW;
-        const y2 = (cy + h / 2) * imgH;
+        // Remove letterbox padding, then scale to original image coordinates
+        const x1 = (x1_640 - padX) / scale;
+        const y1 = (y1_640 - padY) / scale;
+        const x2 = (x2_640 - padX) / scale;
+        const y2 = (y2_640 - padY) / scale;
 
-        // Model trained on Knife (0) and Pistol (1)
-        const label = ["Knife", "Pistol"][maxClass] || "Weapon";
+        // Clamp to image bounds
+        const x1_clamped = Math.max(0, Math.min(originalWidth, x1));
+        const y1_clamped = Math.max(0, Math.min(originalHeight, y1));
+        const x2_clamped = Math.max(0, Math.min(originalWidth, x2));
+        const y2_clamped = Math.max(0, Math.min(originalHeight, y2));
 
-        // Store in format expected by detectionQueue: [x1, y1, x2, y2, label, confidence]
-        boxes.push([x1, y1, x2, y2, label, maxScore]);
+        const label = ["Knife", "Pistol"][classId];
+        boxes.push([x1_clamped, y1_clamped, x2_clamped, y2_clamped, label, confidence]);
     }
 
-    // Sort by confidence
     boxes.sort((a, b) => b[5] - a[5]);
 
-    const detected = boxes.length > 0;
+    log.info({
+        totalDetections: boxes.length,
+        aboveThreshold: boxes.length,
+        threshold: probThreshold
+    }, "🔫 WEAPON: Detection summary");
 
     return {
         boxes,
-        detected,
+        detected: boxes.length > 0,
     };
 }
 
@@ -262,17 +256,22 @@ function processOutput(outputs, imgW = 640, imgH = 640) {
 export async function detectWeapon(cameraUrl, cameraName) {
     try {
         const jpegBuffer = await grabFrameOnce(cameraUrl);
-        const inputTensor = await prepareInput(jpegBuffer, 640);
-        const outputs = await runInference(inputTensor);
+        const { tensor, originalWidth, originalHeight, scale, padX, padY } = await prepareInput(jpegBuffer, 640);
+        const outputs = await runInference(tensor);
 
         // Log output shape for debugging
         const debugShapes = {};
         for (const key in outputs) {
             debugShapes[key] = outputs[key].dims;
         }
-        log.info({ camera: cameraName, outputShapes: debugShapes }, "🔫 WEAPON: RT-DETR Inference Output");
+        log.info({
+            camera: cameraName,
+            outputShapes: debugShapes,
+            originalSize: `${originalWidth}x${originalHeight}`,
+            letterbox: { scale: scale.toFixed(4), padX: padX.toFixed(1), padY: padY.toFixed(1) }
+        }, "🔫 WEAPON: RT-DETR Inference Output");
 
-        const result = processOutput(outputs, 640, 640);
+        const result = processOutput(outputs, originalWidth, originalHeight, scale, padX, padY);
 
         log.info({
             camera: cameraName,

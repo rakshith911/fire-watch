@@ -72,10 +72,21 @@ function grabFrameOnce(srcUrl) {
 }
 
 // -------------------------------------------------------------------
-// 🔄 Image Preprocessing (Canvas → Sharp)
+// 🔄 Image Preprocessing (FIXED: returns original dimensions + letterbox info)
 // -------------------------------------------------------------------
 async function prepareInput(jpegBuffer, modelInputSize = 640) {
     try {
+        const metadata = await sharp(jpegBuffer).metadata();
+        const origW = metadata.width;
+        const origH = metadata.height;
+
+        // Calculate letterbox parameters
+        const scale = Math.min(modelInputSize / origW, modelInputSize / origH);
+        const newW = Math.round(origW * scale);
+        const newH = Math.round(origH * scale);
+        const padX = (modelInputSize - newW) / 2;  // Left padding
+        const padY = (modelInputSize - newH) / 2;  // Top padding
+
         const { data } = await sharp(jpegBuffer)
             .resize(modelInputSize, modelInputSize, {
                 fit: "contain",
@@ -87,7 +98,6 @@ async function prepareInput(jpegBuffer, modelInputSize = 640) {
         const N = modelInputSize * modelInputSize;
         const arr = new Float32Array(N * 3);
 
-        // Standard normalization (0-1)
         let r = 0, g = N, b = 2 * N;
         for (let i = 0; i < data.length; i += 3) {
             arr[r++] = data[i] / 255.0;
@@ -95,7 +105,14 @@ async function prepareInput(jpegBuffer, modelInputSize = 640) {
             arr[b++] = data[i + 2] / 255.0;
         }
 
-        return arr;
+        return {
+            tensor: arr,
+            originalWidth: origW,
+            originalHeight: origH,
+            scale,      // The scale factor used
+            padX,       // Horizontal padding (left)
+            padY        // Vertical padding (top)
+        };
     } catch (e) {
         log.error({ error: e.message }, "Failed to preprocess image");
         throw e;
@@ -128,131 +145,160 @@ async function runInference(inputTensor) {
 }
 
 // -------------------------------------------------------------------
-// 📊 Process YOLO Output
+// 📊 NMS Helper Functions
 // -------------------------------------------------------------------
-function processOutput(outputs, imgW = 640, imgH = 640) {
+function computeIoU(boxA, boxB) {
+    const [ax1, ay1, ax2, ay2] = boxA;
+    const [bx1, by1, bx2, by2] = boxB;
+
+    const ix1 = Math.max(ax1, bx1);
+    const iy1 = Math.max(ay1, by1);
+    const ix2 = Math.min(ax2, bx2);
+    const iy2 = Math.min(ay2, by2);
+
+    const iw = Math.max(0, ix2 - ix1);
+    const ih = Math.max(0, iy2 - iy1);
+    const intersection = iw * ih;
+
+    const areaA = (ax2 - ax1) * (ay2 - ay1);
+    const areaB = (bx2 - bx1) * (by2 - by1);
+    const union = areaA + areaB - intersection;
+
+    return union > 0 ? intersection / union : 0;
+}
+
+function applyNMS(boxes, iouThreshold = 0.5) {
+    if (boxes.length === 0) return [];
+
+    const result = [];
+    const used = new Set();
+
+    for (let i = 0; i < boxes.length; i++) {
+        if (used.has(i)) continue;
+
+        result.push(boxes[i]);
+        used.add(i);
+
+        for (let j = i + 1; j < boxes.length; j++) {
+            if (used.has(j)) continue;
+            if (computeIoU(boxes[i], boxes[j]) > iouThreshold) {
+                used.add(j);
+            }
+        }
+    }
+    return result;
+}
+
+// -------------------------------------------------------------------
+// 📊 Process YOLOv8 Output (FIXED: Column-Major Layout + letterbox compensation)
+// -------------------------------------------------------------------
+function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY) {
     let boxes = [];
-
     const keys = Object.keys(outputs);
-    let combined = null;
-    let rawBoxes = null;
-    let rawScores = null;
 
+    let combined = null;
     if (keys.length === 1) {
         combined = outputs[keys[0]].data;
-    } else if (keys.includes("boxes") && keys.includes("scores")) {
-        // RT-DETR style
-        rawBoxes = outputs["boxes"].data;
-        rawScores = outputs["scores"].data;
+    } else {
+        log.warn({ keys }, "Unexpected output format");
+        return { boxes: [], detected: false };
     }
 
-    // Assuming YOLOv8 output structure which is often [1, 4+nc, 8400] or similar
-    // OR RT-DETR style.
-    // We will try to adapt based on what we see.
-    // For now, let's assume RT-DETR/YOLO from the other detectors:
-    // They used a FLAT array parsing logic.
-    // Let's copy the logic from localWeaponDetector and adapt classes.
+    // YOLOv8 output shape: [1, 6, 8400] → flattened = 50400
+    // 6 = [cx, cy, w, h, class0_score, class1_score]
+    // Layout is COLUMN-MAJOR (all cx first, then all cy, etc.)
 
-    const numQueries = 300; // RT-DETR standard
-    // If it's YOLOv8n, the output might be varying.
-    // But since the user used the provided prompt which likely used export default (which might be 1x84x8400 for YOLO)
-    // ADAPTATION: The other detectors seem to be using RT-DETR or models exported with specific output shapes.
-    // If the user trained standard YOLOv8n, the output is usually [1, 4+nc, N].
-    // However, the existing code uses a specific parsing loop.
-    // I will stick to the existing generic parsing logic but be aware it might need tuning if the model is pure YOLOv8.
+    const numChannels = 6;  // 4 box coords + 2 classes
+    const numDetections = combined.length / numChannels;  // Should be 8400
 
-    const numClasses = 2; // Person, Theft (adjust based on actual model)
-    const probThreshold = 0.60;
+    log.info({
+        dataLength: combined.length,
+        calculatedDetections: numDetections,
+        expectedDetections: 8400
+    }, "🕵️ THEFT: Output shape analysis");
 
-    // Helper to get box coordinates
-    const getBox = (i) => {
-        // ... (Reuse logic from weapon detector)
-        if (rawBoxes) {
-            const offset = i * 4;
-            return [rawBoxes[offset], rawBoxes[offset + 1], rawBoxes[offset + 2], rawBoxes[offset + 3]];
-        } else if (combined) {
-            // If it's standard YOLOv8 [1, 4+nc, N], this flat parsing might be wrong if N is large (8400).
-            // BUT, `localDetector.js` uses `stride = 4 + numClasses`.
-            // Let's assume the user's model is compatible or we use the generic parsing.
-            const stride = 4 + numClasses;
-            const offset = i * stride;
-            return [combined[offset], combined[offset + 1], combined[offset + 2], combined[offset + 3]];
-        }
-        return [0, 0, 0, 0];
-    };
-
-    const getScore = (i) => {
-        let maxScore = 0;
-        let maxClass = -1;
-        // ...
-        if (rawScores) {
-            const offset = i * numClasses;
-            for (let c = 0; c < numClasses; c++) {
-                const s = rawScores[offset + c];
-                if (s > maxScore) { maxScore = s; maxClass = c; }
-            }
-        } else if (combined) {
-            const stride = 4 + numClasses;
-            const offset = i * stride + 4;
-            for (let c = 0; c < numClasses; c++) {
-                const s = combined[offset + c];
-                if (s > maxScore) { maxScore = s; maxClass = c; }
-            }
-        }
-        return { maxScore, maxClass };
-    };
-
-    // Run over queries
-    // WARNING: If this is YOLOv8, 'numQueries' is 8400, not 300.
-    // Let's try to detect count from data length.
-    let loopCount = numQueries;
-    if (combined) {
-        loopCount = combined.length / (4 + numClasses);
-    } else if (rawScores) {
-        loopCount = rawScores.length / numClasses;
+    if (numDetections !== 8400) {
+        log.warn({ numDetections }, "Unexpected number of detections - model may have different output");
     }
 
-    // DEBUG: Log top 5 scores regardless of threshold
+    const probThreshold = 0.5;
+
+    // Column-major accessors
+    // Data layout: [all_cx, all_cy, all_w, all_h, all_class0, all_class1]
+    const getCx = (i) => combined[i];
+    const getCy = (i) => combined[numDetections + i];
+    const getW = (i) => combined[2 * numDetections + i];
+    const getH = (i) => combined[3 * numDetections + i];
+    const getClass0Score = (i) => combined[4 * numDetections + i];  // theft-action
+    const getClass1Score = (i) => combined[5 * numDetections + i];  // normal
+
+    // DEBUG: Log top 5 theft-action scores
     const allScores = [];
-    for (let i = 0; i < loopCount; i++) {
-        const { maxScore, maxClass } = getScore(i);
-        allScores.push({ score: maxScore, class: maxClass });
+    for (let i = 0; i < numDetections; i++) {
+        const s0 = getClass0Score(i);  // theft-action
+        const s1 = getClass1Score(i);  // normal
+        allScores.push({
+            theftScore: s0,
+            normalScore: s1,
+            index: i,
+            cx: getCx(i),
+            cy: getCy(i)
+        });
     }
-    allScores.sort((a, b) => b.score - a.score);
+
+    // Sort by theft-action score (class 0)
+    allScores.sort((a, b) => b.theftScore - a.theftScore);
+
     const top5 = allScores.slice(0, 5).map(s => ({
-        score: s.score.toFixed(4),
-        label: ["Person", "Theft"][s.class] || "Unknown",
-        classIndex: s.class
+        theftScore: s.theftScore.toFixed(4),
+        normalScore: s.normalScore.toFixed(4),
+        position: `(${s.cx.toFixed(0)}, ${s.cy.toFixed(0)})`
     }));
-    log.info({ top5 }, "🕵️ THEFT: Top 5 Raw Scores");
+    log.info({ top5, letterbox: { scale, padX, padY } }, "🕵️ THEFT: Top 5 Theft-Action Scores (class 0)");
 
-    for (let i = 0; i < loopCount; i++) {
-        const { maxScore, maxClass } = getScore(i);
+    for (let i = 0; i < numDetections; i++) {
+        const theftScore = getClass0Score(i);  // Class 0 = theft-action
 
-        if (maxScore < probThreshold) continue;
+        // Only detect theft-action (class 0), ignore normal (class 1)
+        if (theftScore < probThreshold) continue;
 
-        const [cx, cy, w, h] = getBox(i);
+        const cx = getCx(i);
+        const cy = getCy(i);
+        const w = getW(i);
+        const h = getH(i);
 
-        const x1 = (cx - w / 2) * imgW;
-        const y1 = (cy - h / 2) * imgH;
-        const x2 = (cx + w / 2) * imgW;
-        const y2 = (cy + h / 2) * imgH;
+        // Convert center format to corner format (still in 640x640 space)
+        const x1_640 = cx - w / 2;
+        const y1_640 = cy - h / 2;
+        const x2_640 = cx + w / 2;
+        const y2_640 = cy + h / 2;
 
-        // Class 0: Person (likely)
-        // Class 1: Theft (likely)
-        // Adjust based on prompt: "classes should be person, theft-action"
-        const label = ["Person", "Theft"][maxClass] || "Unknown";
+        // Remove letterbox padding, then scale to original image coordinates
+        const x1 = (x1_640 - padX) / scale;
+        const y1 = (y1_640 - padY) / scale;
+        const x2 = (x2_640 - padX) / scale;
+        const y2 = (y2_640 - padY) / scale;
 
-        if (label === "Theft") {
-            boxes.push([x1, y1, x2, y2, label, maxScore]);
-        }
+        // Clamp to image bounds
+        const x1_clamped = Math.max(0, Math.min(originalWidth, x1));
+        const y1_clamped = Math.max(0, Math.min(originalHeight, y1));
+        const x2_clamped = Math.max(0, Math.min(originalWidth, x2));
+        const y2_clamped = Math.max(0, Math.min(originalHeight, y2));
+
+        boxes.push([x1_clamped, y1_clamped, x2_clamped, y2_clamped, "Theft", theftScore]);
     }
 
+    // Sort by confidence
     boxes.sort((a, b) => b[5] - a[5]);
 
-    // NMS (Non-Maximum Suppression) might be needed for YOLOv8
-    // Existing detectors don't seemingly do NMS in JS, possibly relying on model export doing it or RT-DETR.
-    // We will assume rudimentary NMS or rely on high threshold.
+    // Apply NMS (YOLOv8 produces many overlapping detections)
+    boxes = applyNMS(boxes, 0.5);
+
+    log.info({
+        beforeNMS: allScores.filter(s => s.theftScore >= probThreshold).length,
+        afterNMS: boxes.length,
+        threshold: probThreshold
+    }, "🕵️ THEFT: Detection summary");
 
     return {
         boxes,
@@ -266,16 +312,21 @@ function processOutput(outputs, imgW = 640, imgH = 640) {
 export async function detectTheft(cameraUrl, cameraName) {
     try {
         const jpegBuffer = await grabFrameOnce(cameraUrl);
-        const inputTensor = await prepareInput(jpegBuffer, 640);
-        const outputs = await runInference(inputTensor);
+        const { tensor, originalWidth, originalHeight, scale, padX, padY } = await prepareInput(jpegBuffer, 640);
+        const outputs = await runInference(tensor);
 
         const debugShapes = {};
         for (const key in outputs) {
             debugShapes[key] = outputs[key].dims;
         }
-        log.info({ camera: cameraName, outputShapes: debugShapes }, "🕵️ THEFT: Inference Output");
+        log.info({
+            camera: cameraName,
+            outputShapes: debugShapes,
+            originalSize: `${originalWidth}x${originalHeight}`,
+            letterbox: { scale: scale.toFixed(4), padX: padX.toFixed(1), padY: padY.toFixed(1) }
+        }, "🕵️ THEFT: Inference Output");
 
-        const result = processOutput(outputs, 640, 640);
+        const result = processOutput(outputs, originalWidth, originalHeight, scale, padX, padY);
 
         log.info({
             camera: cameraName,
