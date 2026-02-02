@@ -1,5 +1,6 @@
 import pino from "pino";
 import { detectFire, buildCameraUrl } from "./localDetector.js";
+import { detectFireCloud } from "./cloudDetector.js";
 import { detectWeapon } from "./localWeaponDetector.js";
 import { detectTheft } from "./localTheftDetector.js";
 import livenessValidator from "./livenessValidator.js";
@@ -179,7 +180,8 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
     }
   }
 
-  const detectionType = (camera.aiType || camera.detection || "LOCAL").toUpperCase();
+  // aiType determines WHAT to detect (FIRE, WEAPON, THEFT)
+  const aiType = (camera.aiType || "FIRE").toUpperCase();
 
   log.info(
     {
@@ -187,19 +189,19 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
       name: camera.name,
       frameCount: FRAMES_PER_CHECK,
       intervalMs: frameInterval,
-      detectionType,
+      aiType,
       source: sourceLog,
       url: cameraUrl
     },
-    `📸 Extracting ${FRAMES_PER_CHECK} frames for LOCAL IoU analysis...`
+    `📸 Extracting ${FRAMES_PER_CHECK} frames for LOCAL ${aiType} analysis...`
   );
 
   for (let i = 0; i < FRAMES_PER_CHECK; i++) {
     try {
       let result;
-      if (detectionType === "WEAPON") {
+      if (aiType === "WEAPON") {
         result = await detectWeapon(cameraUrl, camera.name);
-      } else if (detectionType === "THEFT") {
+      } else if (aiType === "THEFT") {
         result = await detectTheft(cameraUrl, camera.name);
       } else {
         // Default to FIRE (LOCAL)
@@ -217,11 +219,11 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
           smokeCount: result.smokeCount || 0,
           confidence: result.confidence,
           frameBuffer: result.frameBuffer,
-          detectionType // Store type for later
+          aiType // Store type for later
         });
 
         const detectedLabel = result.boxes.length > 0 ? result.boxes[0][4] : "Object";
-        const prefix = detectionType === "WEAPON" ? "🔫 WEAPON" : detectionType === "THEFT" ? "🕵️ THEFT" : "🔥 LOCAL";
+        const prefix = aiType === "WEAPON" ? "🔫 WEAPON" : aiType === "THEFT" ? "🕵️ THEFT" : "🔥 LOCAL";
 
         log.info(
           {
@@ -234,7 +236,7 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
           `${prefix} Frame ${i + 1}/${FRAMES_PER_CHECK}: ${detectedLabel} detected`
         );
       } else {
-        const prefix = detectionType === "WEAPON" ? "✅ WEAPON" : detectionType === "THEFT" ? "✅ THEFT" : "✅ LOCAL";
+        const prefix = aiType === "WEAPON" ? "✅ WEAPON" : aiType === "THEFT" ? "✅ THEFT" : "✅ LOCAL";
         log.info(
           {
             id: camera.id,
@@ -255,12 +257,64 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
           name: camera.name,
           error: error.message,
         },
-        `❌ ${detectionType} Detection error - skipping frame`
+        `❌ ${aiType} Detection error - skipping frame`
       );
     }
   }
 
   return frames;
+}
+
+// -------------------------------------------------------------------
+// 🌥️ CLOUD Detection Wrapper
+// -------------------------------------------------------------------
+async function extractMultipleFramesCloud(camera) {
+  const cameraUrl = buildCameraUrl(camera);
+
+  log.info(
+    {
+      id: camera.id,
+      name: camera.name,
+      frameCount: FRAMES_PER_CHECK,
+    },
+    `📸 Running CLOUD detection (multi-frame with IoU in cloud)...`
+  );
+
+  try {
+    const result = await detectFireCloud(cameraUrl, camera.name);
+
+    if (!result || !result.isFire) {
+      log.info(
+        { id: camera.id, name: camera.name, reason: result?.reason },
+        "✅ CLOUD: No fire detected"
+      );
+      return [];
+    }
+
+    // Map to a "frame-like" structure so the rest of the code can handle it uniformly
+    return [
+      {
+        timestamp: new Date().toISOString(),
+        boxes: [],
+        fireCount: 1,
+        smokeCount: 0,
+        confidence: result.confidence ?? 1.0,
+        frameBuffer: null,
+        cloudResult: result,
+        detectionType: "CLOUD"
+      },
+    ];
+  } catch (error) {
+    log.error(
+      {
+        id: camera.id,
+        name: camera.name,
+        error: error.message,
+      },
+      "❌ CLOUD detection failed"
+    );
+    return [];
+  }
 }
 
 // -------------------------------------------------------------------
@@ -342,6 +396,8 @@ export function addCameraToQueue(camera) {
     {
       id: camera.id,
       name: camera.name,
+      aiType: camera.aiType,        // DEBUG: Show what aiType camera has
+      detection: camera.detection,  // DEBUG: Show detection field
       queueSize: cameraQueue.length,
       samplingWindow,
       newInterval,
@@ -456,13 +512,32 @@ async function startQueueLoop() {
         cameraQueue.length
       );
       const currentFrameInterval = calculateFrameInterval(currentCameraInterval);
-      const detectionType = (camera.aiType || camera.detection || "LOCAL").toUpperCase();
+      // aiType = WHAT to detect (FIRE, WEAPON, THEFT)
+      // detection = HOW to detect for FIRE (LOCAL, CLOUD)
+      const aiType = (camera.aiType || "FIRE").toUpperCase();
+      const detectionMethod = (camera.detection || "LOCAL").toUpperCase();
+
+      // For FIRE, check if using CLOUD or LOCAL method
+      // For WEAPON/THEFT, always use local (they don't have cloud endpoints)
+      let detectionType;
+      if (aiType === "FIRE" && detectionMethod === "CLOUD") {
+        detectionType = "CLOUD";
+      } else if (aiType === "WEAPON") {
+        detectionType = "WEAPON";
+      } else if (aiType === "THEFT") {
+        detectionType = "THEFT";
+      } else {
+        // Default: LOCAL fire detection
+        detectionType = "LOCAL";
+      }
 
       log.info(
         {
           id: camera.id,
           name: camera.name,
-          detection: detectionType,
+          aiType: aiType,
+          detectionMethod: detectionMethod,
+          resolvedType: detectionType,
           position: `${currentIndex + 1}/${cameraQueue.length}`,
           cameraInterval: currentCameraInterval,
           frameInterval: currentFrameInterval,
@@ -470,13 +545,13 @@ async function startQueueLoop() {
         `🔍 Starting ${detectionType} detection...`
       );
 
-      // ✅ EXTRACT MULTIPLE FRAMES (Handles both Fire and Weapon via extractMultipleFramesLocal)
+      // ✅ EXTRACT MULTIPLE FRAMES
       let frames = [];
       if (detectionType === "CLOUD") {
-        // Cloud logic (unchanged)
-        // ... (omitted for brevity if not used, but keeping structure)
+        // Cloud detection - IoU is handled in the cloud endpoint
+        frames = await extractMultipleFramesCloud(camera);
       } else {
-        // LOCAL or WEAPON
+        // LOCAL, WEAPON, or THEFT
         frames = await extractMultipleFramesLocal(camera, currentFrameInterval);
       }
 
@@ -516,19 +591,54 @@ async function startQueueLoop() {
         let isRealDetection = false;
         let iouAnalysis = null;
 
-        if (detectionType === "WEAPON") {
-          // 🔫 WEAPON: Check Depth (Real 3D vs Fake 2D)
-          const lastFrame = frames[frames.length - 1];
-          if (lastFrame && lastFrame.boxes.length > 0) {
-            const bbox = lastFrame.boxes[0]; // [x1, y1, x2, y2, label, conf]
-            const is3D = await livenessValidator.isWeapon3D(lastFrame.frameBuffer, bbox);
+        if (detectionType === "CLOUD") {
+          // 🌥️ CLOUD: IoU/static detection already handled by cloud endpoint
+          // If we got frames back, it means cloud confirmed real fire
+          const cloudResult = frames[0]?.cloudResult;
+          if (cloudResult && cloudResult.isFire) {
+            isRealDetection = true;
+            iouAnalysis = cloudResult.iouAnalysis || null;
+            log.info(
+              { reason: cloudResult.reason, confidence: cloudResult.confidence },
+              "🌥️ CLOUD: Fire confirmed by cloud endpoint"
+            );
+          }
+        } else if (detectionType === "WEAPON") {
+          // 🔫 WEAPON: Use Multi-Frame Consistency + Motion (NOT depth - knives are too thin)
+          // Depth variance fails for thin objects like knives, so we use a different approach:
+          // 1. Must be detected in 2+ frames (consistency)
+          // 2. Must have some movement (IoU < 0.95) OR high confidence (>0.7)
 
-            if (is3D) {
+          const framesWithBoxes = frames.filter(f => f.boxes && f.boxes.length > 0);
+
+          if (framesWithBoxes.length >= 2) {
+            // Check for motion between frames (boxes should move slightly if real)
+            iouAnalysis = analyzeBoxes(frames);
+            const avgIoU = parseFloat(iouAnalysis.avgIoU || "0");
+            const maxConfidence = Math.max(...framesWithBoxes.map(f => f.boxes[0][5]));
+
+            // Real weapon criteria:
+            // - Some movement (IoU < 0.95) indicating it's not a static poster
+            // - OR very high confidence (>0.7) even if static (person holding still)
+            const hasMovement = avgIoU < 0.95;
+            const highConfidence = maxConfidence > 0.7;
+
+            log.info({
+              framesDetected: framesWithBoxes.length,
+              avgIoU,
+              maxConfidence: maxConfidence.toFixed(3),
+              hasMovement,
+              highConfidence
+            }, "🔫 WEAPON: Multi-frame analysis");
+
+            if (hasMovement || highConfidence) {
               isRealDetection = true;
-              log.info("🔫 WEAPON: Liveness Check PASSED (3D Object)");
+              log.info(`🔫 WEAPON: Liveness PASSED (${hasMovement ? 'Movement detected' : 'High confidence'})`);
             } else {
-              log.warn("⚠️ WEAPON: Liveness Check FAILED (2D/Flat Image) - Ignoring");
+              log.warn("⚠️ WEAPON: Liveness FAILED (Static + Low confidence - likely poster)");
             }
+          } else {
+            log.warn({ framesDetected: framesWithBoxes.length }, "⚠️ WEAPON: Not enough frames with detection");
           }
         } else if (detectionType === "THEFT") {
           // 🕵️ THEFT: Check Motion (IoU) AND Depth (Real Person vs Poster)
@@ -791,10 +901,19 @@ export function updateCameraInQueue(id, updates) {
     return;
   }
 
+  // DEBUG: Log before and after
+  const beforeAiType = cam.aiType;
+  const beforeDetection = cam.detection;
+
   Object.assign(cam, updates);
 
   log.info(
-    { id, updates, newDetection: cam.detection, aiType: cam.aiType },
+    {
+      id,
+      updates,
+      before: { aiType: beforeAiType, detection: beforeDetection },
+      after: { aiType: cam.aiType, detection: cam.detection }
+    },
     "🔄 Camera updated in detectionQueue memory"
   );
 }

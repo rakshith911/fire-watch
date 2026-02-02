@@ -186,12 +186,12 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
             score: conf,
             class: classId,
             index: i,
-            rawBox: [
-                combined[offset].toFixed(1),
-                combined[offset + 1].toFixed(1),
-                combined[offset + 2].toFixed(1),
-                combined[offset + 3].toFixed(1)
-            ]
+            rawBox: {
+                cx: combined[offset].toFixed(3),
+                cy: combined[offset + 1].toFixed(3),
+                w: combined[offset + 2].toFixed(3),
+                h: combined[offset + 3].toFixed(3)
+            }
         });
     }
     allScores.sort((a, b) => b.score - a.score);
@@ -199,26 +199,30 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
     const top5 = allScores.slice(0, 5).map(s => ({
         score: s.score.toFixed(4),
         label: ["Knife", "Pistol"][s.class] ?? `Unknown(${s.class})`,
-        classIndex: s.class,
-        rawBox: s.rawBox
+        box: s.rawBox  // {cx, cy, w, h} normalized
     }));
-    log.info({ top5, letterbox: { scale, padX, padY } }, "🔫 WEAPON: Top 5 Raw Scores (RT-DETR format: x1,y1,x2,y2,conf,cls)");
+    log.info({ top5, letterbox: { scale, padX, padY } }, "🔫 WEAPON: Top 5 Scores (cx,cy,w,h normalized)");
 
     for (let i = 0; i < numQueries; i++) {
         const offset = i * stride;
         if (offset + 5 >= combined.length) break;
 
-        // RT-DETR format: [x1, y1, x2, y2, confidence, class_id]
-        // Coordinates are ABSOLUTE in 640x640 space (includes letterbox padding)
-        const x1_640 = combined[offset + 0];
-        const y1_640 = combined[offset + 1];
-        const x2_640 = combined[offset + 2];
-        const y2_640 = combined[offset + 3];
+        // RT-DETR format: [cx, cy, w, h, confidence, class_id] - NORMALIZED (0-1)
+        const cx = combined[offset + 0];
+        const cy = combined[offset + 1];
+        const w = combined[offset + 2];
+        const h = combined[offset + 3];
         const confidence = combined[offset + 4];
         const classId = Math.round(combined[offset + 5]);
 
         if (confidence < probThreshold) continue;
         if (classId < 0 || classId > 1) continue;
+
+        // Convert normalized center format to corner format in 640x640 space
+        const x1_640 = (cx - w / 2) * 640;
+        const y1_640 = (cy - h / 2) * 640;
+        const x2_640 = (cx + w / 2) * 640;
+        const y2_640 = (cy + h / 2) * 640;
 
         // Remove letterbox padding, then scale to original image coordinates
         const x1 = (x1_640 - padX) / scale;

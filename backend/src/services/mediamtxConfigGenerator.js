@@ -81,7 +81,7 @@ function buildMediaMTXConfig(cameras, serverIP) {
 
     hls: true,
     hlsAddress: ":8888",
-    hlsAllowOrigin: "*",
+    hlsAllowOrigins: ["*"],
     hlsVariant: "lowLatency",
     hlsSegmentCount: 3,
     hlsSegmentDuration: "1s",
@@ -89,7 +89,7 @@ function buildMediaMTXConfig(cameras, serverIP) {
 
     webrtc: true,
     webrtcAddress: ":8889",
-    webrtcAllowOrigin: "*",
+    webrtcAllowOrigins: ["*"],
     webrtcLocalUDPAddress: ":8189",
     webrtcLocalTCPAddress: ":8189",
     webrtcIPsFromInterfaces: false,
@@ -100,6 +100,9 @@ function buildMediaMTXConfig(cameras, serverIP) {
 
     readTimeout: "10s",
     writeTimeout: "10s",
+
+    // Buffer settings to reduce packet loss
+    writeQueueSize: 2048,
 
     paths: buildCameraPaths(cameras),
   };
@@ -140,6 +143,7 @@ function buildCameraPathConfig(cam) {
 
   if ((cam.streamType === "RTSP" || cam.streamType === "WEBRTC") && cam.ip) {
     pathConfig.source = buildRTSPUrl(cam);
+    pathConfig.rtspTransport = "tcp";  // Force TCP to avoid UDP packet loss
   } else if (cam.streamType === "HLS" && cam.hlsUrl) {
     pathConfig.source = cam.hlsUrl;
   }

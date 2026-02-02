@@ -108,12 +108,13 @@ class LivenessValidator {
             const min = Math.min(...values);
             const max = Math.max(...values);
 
-            log('[Liveness] Weapon Depth Stats:', { stdDev: stdDev.toFixed(5), min: min.toFixed(5), max: max.toFixed(5), range: (max - min).toFixed(5) });
+            const is3D = stdDev > 0.001;
+            console.log(`[Liveness] 🔍 DEPTH ANALYSIS: stdDev=${stdDev.toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}, range=${(max - min).toFixed(4)}, pixels=${values.length}, RESULT=${is3D ? '3D_REAL' : '2D_FLAT'}`);
 
             // Threshold: Lowered significantly to catch thin objects like knives
             // Previously was stdDev / 15.0 > 0.4 (effective stdDev > 6.0)
             // Now checking raw stdDev. Knives might be around 0.05 - 0.2
-            return stdDev > 0.001;
+            return is3D;
         } catch (err) {
             console.error("[Liveness] Error processing weapon depth:", err);
             return true; // Fail safe

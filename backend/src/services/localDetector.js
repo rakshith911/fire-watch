@@ -77,6 +77,18 @@ function grabFrameOnce(srcUrl) {
 // -------------------------------------------------------------------
 async function prepareInput(jpegBuffer, modelInputSize = 640) {
   try {
+    // Get original dimensions for letterbox calculation
+    const metadata = await sharp(jpegBuffer).metadata();
+    const origW = metadata.width;
+    const origH = metadata.height;
+
+    // Calculate letterbox parameters
+    const scale = Math.min(modelInputSize / origW, modelInputSize / origH);
+    const newW = Math.round(origW * scale);
+    const newH = Math.round(origH * scale);
+    const padX = (modelInputSize - newW) / 2;
+    const padY = (modelInputSize - newH) / 2;
+
     const { data, info } = await sharp(jpegBuffer)
       .resize(modelInputSize, modelInputSize, {
         fit: "contain",
@@ -96,7 +108,14 @@ async function prepareInput(jpegBuffer, modelInputSize = 640) {
       arr[b++] = data[i + 2] / 255.0;
     }
 
-    return arr;
+    return {
+      tensor: arr,
+      originalWidth: origW,
+      originalHeight: origH,
+      scale,
+      padX,
+      padY
+    };
   } catch (e) {
     log.error({ error: e.message }, "Failed to preprocess image");
     throw e;
@@ -133,7 +152,7 @@ async function runInference(inputTensor) {
 // -------------------------------------------------------------------
 // 📊 Process RT-DETR Output
 // -------------------------------------------------------------------
-function processOutput(outputs, imgW = 640, imgH = 640) {
+function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY) {
   let boxes = [];
   let fireCount = 0;
   let smokeCount = 0;
@@ -156,8 +175,8 @@ function processOutput(outputs, imgW = 640, imgH = 640) {
   }
 
   const numQueries = 300; // Standard RT-DETR query count
-  const numClasses = 3; // Fire, Smoke, Other
-  const probThreshold = 0.85; // Confidence threshold (Increased to 0.85 to stop false positives)
+  const numClasses = 3; // Fire, Other, Smoke (per model training spec)
+  const probThreshold = 0.5; // Confidence threshold (0.5 recommended for production)
 
   // Helper to get box coordinates
   const getBox = (i) => {
@@ -222,9 +241,12 @@ function processOutput(outputs, imgW = 640, imgH = 640) {
     allScores.push({ score: maxScore, class: maxClass });
   }
   allScores.sort((a, b) => b.score - a.score);
+  // Class order per model spec: fire=0, other=1, smoke=2
+  const CLASS_NAMES = ["Fire", "Other", "Smoke"];
+
   const top5 = allScores.slice(0, 5).map(s => ({
     score: s.score.toFixed(4),
-    label: ["Fire", "Smoke", "Other"][s.class] || "Unknown"
+    label: CLASS_NAMES[s.class] || "Unknown"
   }));
   log.info({ top5 }, "🔥 LOCAL: Top 5 Raw Scores");
 
@@ -232,21 +254,34 @@ function processOutput(outputs, imgW = 640, imgH = 640) {
     const { maxScore, maxClass } = getScore(i);
 
     if (maxScore < probThreshold) continue;
+    if (maxClass === 1) continue; // Skip "Other" class (index 1) - only care about Fire/Smoke
 
     const [cx, cy, w, h] = getBox(i);
 
-    // Convert cx, cy, w, h (normalized 0-1) to x1, y1, x2, y2 (pixel coords)
-    const x1 = (cx - w / 2) * imgW;
-    const y1 = (cy - h / 2) * imgH;
-    const x2 = (cx + w / 2) * imgW;
-    const y2 = (cy + h / 2) * imgH;
+    // Convert cx, cy, w, h (normalized 0-1) to corner format in 640x640 space
+    const x1_640 = (cx - w / 2) * 640;
+    const y1_640 = (cy - h / 2) * 640;
+    const x2_640 = (cx + w / 2) * 640;
+    const y2_640 = (cy + h / 2) * 640;
 
-    const label = ["Fire", "Smoke", "Other"][maxClass] || "Unknown";
+    // Remove letterbox padding, then scale to original image coordinates
+    const x1 = (x1_640 - padX) / scale;
+    const y1 = (y1_640 - padY) / scale;
+    const x2 = (x2_640 - padX) / scale;
+    const y2 = (y2_640 - padY) / scale;
+
+    // Clamp to image bounds
+    const x1_clamped = Math.max(0, Math.min(originalWidth, x1));
+    const y1_clamped = Math.max(0, Math.min(originalHeight, y1));
+    const x2_clamped = Math.max(0, Math.min(originalWidth, x2));
+    const y2_clamped = Math.max(0, Math.min(originalHeight, y2));
+
+    const label = CLASS_NAMES[maxClass] || "Unknown";
 
     // Store in format expected by detectionQueue: [x1, y1, x2, y2, label, confidence]
-    boxes.push([x1, y1, x2, y2, label, maxScore]);
+    boxes.push([x1_clamped, y1_clamped, x2_clamped, y2_clamped, label, maxScore]);
 
-    const area = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+    const area = Math.max(0, x2_clamped - x1_clamped) * Math.max(0, y2_clamped - y1_clamped);
     if (label === "Fire") {
       fireCount++;
       totalFireArea += area;
@@ -277,17 +312,22 @@ function processOutput(outputs, imgW = 640, imgH = 640) {
 export async function detectFire(cameraUrl, cameraName) {
   try {
     const jpegBuffer = await grabFrameOnce(cameraUrl);
-    const inputTensor = await prepareInput(jpegBuffer, 640);
-    const outputs = await runInference(inputTensor);
+    const { tensor, originalWidth, originalHeight, scale, padX, padY } = await prepareInput(jpegBuffer, 640);
+    const outputs = await runInference(tensor);
 
     // Log output shape for debugging
     const debugShapes = {};
     for (const key in outputs) {
       debugShapes[key] = outputs[key].dims;
     }
-    log.info({ camera: cameraName, outputShapes: debugShapes }, "🔥 LOCAL: RT-DETR Inference Output");
+    log.info({
+      camera: cameraName,
+      outputShapes: debugShapes,
+      originalSize: `${originalWidth}x${originalHeight}`,
+      letterbox: { scale: scale.toFixed(4), padX: padX.toFixed(1), padY: padY.toFixed(1) }
+    }, "🔥 LOCAL: RT-DETR Inference Output");
 
-    const result = processOutput(outputs, 640, 640);
+    const result = processOutput(outputs, originalWidth, originalHeight, scale, padX, padY);
 
     log.info({
       camera: cameraName,
