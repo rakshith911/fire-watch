@@ -4,6 +4,7 @@ import { createServer } from "http";
 import cors from "cors";
 import pino from "pino";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { cfg } from "./config.js";
 import { requireAuth } from "./auth/cognitoVerify.js";
@@ -259,6 +260,61 @@ app.get("/healthz", async (_req, res) => {
   res.json({ ok: true, mediamtx: await isMediaMTXRunning() });
 });
 
+// Diagnostic endpoint - check models and system info
+app.get("/diagnostics", async (_req, res) => {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const os = await import("os");
+
+  const modelsDir = process.env.MODELS_DIR_OVERRIDE
+    ? process.env.MODELS_DIR_OVERRIDE
+    : path.resolve(__dirname, "../models");
+
+  const requiredModels = [
+    "best.onnx",
+    "weapons.onnx",
+    "theft.onnx",
+    "depth_anything_v2_small.onnx"
+  ];
+
+  const modelStatus = {};
+  for (const model of requiredModels) {
+    const modelPath = path.join(modelsDir, model);
+    try {
+      if (fs.existsSync(modelPath)) {
+        const stats = fs.statSync(modelPath);
+        modelStatus[model] = {
+          exists: true,
+          sizeMB: (stats.size / 1024 / 1024).toFixed(1),
+          path: modelPath
+        };
+      } else {
+        modelStatus[model] = { exists: false, path: modelPath };
+      }
+    } catch (e) {
+      modelStatus[model] = { exists: false, error: e.message };
+    }
+  }
+
+  res.json({
+    system: {
+      platform: os.default.platform(),
+      arch: os.default.arch(),
+      nodeVersion: process.version,
+      cpuModel: os.default.cpus()[0]?.model || "unknown"
+    },
+    environment: {
+      MODELS_DIR_OVERRIDE: process.env.MODELS_DIR_OVERRIDE || "not set",
+      ELECTRON: process.env.ELECTRON || "not set",
+      NODE_ENV: process.env.NODE_ENV || "not set"
+    },
+    models: {
+      directory: modelsDir,
+      files: modelStatus
+    },
+    mediamtx: await isMediaMTXRunning()
+  });
+});
+
 app.use("/api", requireAuth);
 app.use("/api/cameras", camerasRouter);
 app.use("/api/user", userRouter);
@@ -272,9 +328,83 @@ app.get("*", (req, res) => {
 });
 
 // -------------------------------------------------------------------
+// 🔍 Model Diagnostics - Check all required models at startup
+// -------------------------------------------------------------------
+function checkModelsAtStartup() {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+  const modelsDir = process.env.MODELS_DIR_OVERRIDE
+    ? process.env.MODELS_DIR_OVERRIDE
+    : path.resolve(__dirname, "../models");
+
+  const requiredModels = [
+    { name: "best.onnx", purpose: "Fire Detection" },
+    { name: "weapons.onnx", purpose: "Weapon Detection" },
+    { name: "theft.onnx", purpose: "Theft Detection" },
+    { name: "depth_anything_v2_small.onnx", purpose: "Liveness/Depth Check" },
+  ];
+
+  log.info("═══════════════════════════════════════════════════════════");
+  log.info("🔍 MODEL DIAGNOSTICS");
+  log.info("═══════════════════════════════════════════════════════════");
+  log.info({ modelsDir, override: !!process.env.MODELS_DIR_OVERRIDE }, "Models directory");
+
+  let allPresent = true;
+  const modelStatus = [];
+
+  for (const model of requiredModels) {
+    const modelPath = path.join(modelsDir, model.name);
+    const exists = fs.existsSync(modelPath);
+    let size = 0;
+
+    if (exists) {
+      try {
+        const stats = fs.statSync(modelPath);
+        size = stats.size;
+      } catch (e) {
+        size = -1;
+      }
+    } else {
+      allPresent = false;
+    }
+
+    const status = {
+      model: model.name,
+      purpose: model.purpose,
+      exists,
+      sizeMB: exists ? (size / 1024 / 1024).toFixed(1) : "N/A",
+      path: modelPath
+    };
+    modelStatus.push(status);
+
+    if (exists) {
+      log.info({ ...status }, `✅ ${model.name}`);
+    } else {
+      log.error({ ...status }, `❌ ${model.name} - MISSING!`);
+    }
+  }
+
+  log.info("═══════════════════════════════════════════════════════════");
+
+  if (!allPresent) {
+    log.error("⚠️ SOME MODELS ARE MISSING! Detection may not work properly.");
+    log.error("Models should be at: " + modelsDir);
+  } else {
+    log.info("✅ All required models present");
+  }
+
+  log.info("═══════════════════════════════════════════════════════════");
+
+  return { allPresent, modelStatus, modelsDir };
+}
+
+// -------------------------------------------------------------------
 // 🚀 Main Entrypoint
 // -------------------------------------------------------------------
 async function main() {
+  // Run model diagnostics first
+  const modelCheck = checkModelsAtStartup();
+
   setBroadcastFunction(broadcastFireDetection);
   log.info("🔌 WebSocket broadcast function registered with detection queue");
 

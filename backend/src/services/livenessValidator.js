@@ -14,8 +14,12 @@ function log(msg, data) {
 
 class LivenessValidator {
     constructor() {
-        // Path to the model you uploaded
-        this.modelPath = path.resolve(__dirname, "../../models/depth_anything_v2_small.onnx");
+        // Path to the depth model - check for Electron override first
+        if (process.env.MODELS_DIR_OVERRIDE) {
+            this.modelPath = path.join(process.env.MODELS_DIR_OVERRIDE, "depth_anything_v2_small.onnx");
+        } else {
+            this.modelPath = path.resolve(__dirname, "../../models/depth_anything_v2_small.onnx");
+        }
         this.session = null;
         // Normalization constants for Depth Anything V2
         this.mean = [0.485, 0.456, 0.406];

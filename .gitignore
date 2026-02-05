@@ -9,3 +9,5 @@ backend/models/*.onnx
 backend/.env
 .env
 backend/mediamtx
+backend/bin/ffmpeg
+frontend/electron/build-id.txt

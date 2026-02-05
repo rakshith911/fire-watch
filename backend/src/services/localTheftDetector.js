@@ -63,7 +63,14 @@ function grabFrameOnce(srcUrl) {
 
         ff.stdout.on("data", (d) => chunks.push(d));
         ff.stderr.on("data", (d) => (err += d.toString()));
-        ff.on("error", reject);
+        ff.on("error", (spawnError) => {
+            if (spawnError.code === "ENOENT") {
+                log.error({ ffmpegPath: cfg.ffmpeg }, "❌ FFMPEG NOT FOUND");
+                reject(new Error(`ffmpeg not found at: ${cfg.ffmpeg}`));
+            } else {
+                reject(spawnError);
+            }
+        });
         ff.on("close", (code) => {
             if (code === 0 && chunks.length) resolve(Buffer.concat(chunks));
             else reject(new Error(`ffmpeg exit ${code}: ${err.split("\n").slice(-3).join(" ")}`));

@@ -1,15 +1,8 @@
 import "dotenv/config";
 import path from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
 import os from "os";
-
-// ✅ Import bundled ffmpeg
-let ffmpegStatic;
-try {
-  ffmpegStatic = await import("ffmpeg-static");
-} catch (err) {
-  console.warn("⚠️ ffmpeg-static not found, will use system ffmpeg");
-}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,15 +10,33 @@ const __dirname = path.dirname(__filename);
 // ✅ Detect Electron mode
 const isElectron = process.env.ELECTRON === "true";
 
-// ✅ Get ffmpeg path - use bundled version in production
+// ✅ Get ffmpeg path - check multiple locations
 function getFfmpegPath() {
+  // 1. Explicit override from environment
   if (process.env.FFMPEG_BIN) {
+    console.log("🎬 Using FFMPEG_BIN from env:", process.env.FFMPEG_BIN);
     return process.env.FFMPEG_BIN;
   }
-  if (isElectron && ffmpegStatic) {
-    const bundledPath = ffmpegStatic.default || ffmpegStatic;
-    return bundledPath;
+
+  // 2. Bundled ffmpeg in Electron app (in backend/bin)
+  if (isElectron) {
+    // In production, backend is in resources/backend
+    const bundledPath = path.resolve(__dirname, "../bin/ffmpeg");
+    if (fs.existsSync(bundledPath)) {
+      console.log("🎬 Using bundled ffmpeg:", bundledPath);
+      return bundledPath;
+    }
   }
+
+  // 3. Local development - check backend/bin
+  const devPath = path.resolve(__dirname, "../bin/ffmpeg");
+  if (fs.existsSync(devPath)) {
+    console.log("🎬 Using local ffmpeg:", devPath);
+    return devPath;
+  }
+
+  // 4. System ffmpeg (fallback)
+  console.log("🎬 Using system ffmpeg");
   return "ffmpeg";
 }
 
@@ -63,3 +74,15 @@ export const cfg = {
 
 console.log("✅ Config loaded - DynamoDB mode (no local database)");
 console.log("🔥 Fire Endpoint:", cfg.fireEndpoint);
+
+// Validate ffmpeg exists
+if (cfg.ffmpeg !== "ffmpeg") {
+  if (fs.existsSync(cfg.ffmpeg)) {
+    console.log("✅ ffmpeg found at:", cfg.ffmpeg);
+  } else {
+    console.error("❌ CRITICAL: ffmpeg NOT FOUND at:", cfg.ffmpeg);
+    console.error("   Detection will NOT work without ffmpeg!");
+  }
+} else {
+  console.log("🎬 Using system ffmpeg (must be in PATH)");
+}

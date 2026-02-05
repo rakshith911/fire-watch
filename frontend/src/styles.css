@@ -459,6 +459,7 @@ body {
   transform: translateY(1px);
 }
 
+
 /* ==========================================================================
      TOP TOOLBAR
      ========================================================================== */
@@ -601,6 +602,20 @@ body {
   align-items: center;
   gap: 12px;
   margin-left: auto;
+}
+
+.signout-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.version-text {
+  font-size: 10px;
+  color: var(--primary);
+  font-weight: 600;
+  opacity: 0.9;
 }
 
 .toolbar h2 {

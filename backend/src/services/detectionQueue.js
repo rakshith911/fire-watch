@@ -604,10 +604,11 @@ async function startQueueLoop() {
             );
           }
         } else if (detectionType === "WEAPON") {
-          // 🔫 WEAPON: Use Multi-Frame Consistency + Motion (NOT depth - knives are too thin)
-          // Depth variance fails for thin objects like knives, so we use a different approach:
-          // 1. Must be detected in 2+ frames (consistency)
-          // 2. Must have some movement (IoU < 0.95) OR high confidence (>0.7)
+          // 🔫 WEAPON: Use Multi-Frame Consistency + Motion + Depth
+          // Real weapon criteria (any one of these):
+          // 1. Must be detected in 2+ frames (consistency) AND
+          // 2. Has movement (IoU < 0.95) OR high confidence (>0.7) OR is 3D (depth variance)
+          // Depth check helps distinguish real weapons from flat posters/phone images
 
           const framesWithBoxes = frames.filter(f => f.boxes && f.boxes.length > 0);
 
@@ -617,25 +618,30 @@ async function startQueueLoop() {
             const avgIoU = parseFloat(iouAnalysis.avgIoU || "0");
             const maxConfidence = Math.max(...framesWithBoxes.map(f => f.boxes[0][5]));
 
-            // Real weapon criteria:
-            // - Some movement (IoU < 0.95) indicating it's not a static poster
-            // - OR very high confidence (>0.7) even if static (person holding still)
             const hasMovement = avgIoU < 0.95;
             const highConfidence = maxConfidence > 0.7;
+
+            // Depth check: real weapons (even thin knives) have depth from hand/handle/background
+            // Posters/phone images are completely flat (stdDev ≈ 0)
+            const lastFrame = framesWithBoxes[framesWithBoxes.length - 1];
+            const bbox = lastFrame.boxes[0];
+            const is3D = await livenessValidator.isWeapon3D(lastFrame.frameBuffer, bbox);
 
             log.info({
               framesDetected: framesWithBoxes.length,
               avgIoU,
               maxConfidence: maxConfidence.toFixed(3),
               hasMovement,
-              highConfidence
-            }, "🔫 WEAPON: Multi-frame analysis");
+              highConfidence,
+              is3D
+            }, "🔫 WEAPON: Multi-frame + Depth analysis");
 
-            if (hasMovement || highConfidence) {
+            if (hasMovement || highConfidence || is3D) {
               isRealDetection = true;
-              log.info(`🔫 WEAPON: Liveness PASSED (${hasMovement ? 'Movement detected' : 'High confidence'})`);
+              const reason = hasMovement ? 'Movement detected' : (highConfidence ? 'High confidence' : '3D depth detected');
+              log.info(`🔫 WEAPON: Liveness PASSED (${reason})`);
             } else {
-              log.warn("⚠️ WEAPON: Liveness FAILED (Static + Low confidence - likely poster)");
+              log.warn("⚠️ WEAPON: Liveness FAILED (Static + Low confidence + 2D flat - likely poster)");
             }
           } else {
             log.warn({ framesDetected: framesWithBoxes.length }, "⚠️ WEAPON: Not enough frames with detection");

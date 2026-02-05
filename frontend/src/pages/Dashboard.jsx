@@ -108,7 +108,10 @@ function Dashboard() {
                   {theme === "dark" ? "🌙" : "☀️"}
                 </button>
 
-                <button onClick={logout}>Sign out</button>
+                <div className="signout-wrapper">
+                  <button onClick={logout}>Sign out</button>
+                  <span className="version-text">v0.2.1</span>
+                </div>
               </div>
             </header>
 

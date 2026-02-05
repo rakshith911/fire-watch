@@ -58,13 +58,22 @@ function grabFrameOnce(srcUrl) {
 
     args.push("-i", srcUrl, "-frames:v", "1", "-q:v", "2", "-f", "image2", "-");
 
+    log.debug({ ffmpegPath: cfg.ffmpeg, args }, "Spawning ffmpeg");
+
     const ff = spawn(cfg.ffmpeg, args, { stdio: ["ignore", "pipe", "pipe"] });
     const chunks = [];
     let err = "";
 
     ff.stdout.on("data", (d) => chunks.push(d));
     ff.stderr.on("data", (d) => (err += d.toString()));
-    ff.on("error", reject);
+    ff.on("error", (spawnError) => {
+      if (spawnError.code === "ENOENT") {
+        log.error({ ffmpegPath: cfg.ffmpeg }, "❌ FFMPEG NOT FOUND - Detection cannot work without ffmpeg");
+        reject(new Error(`ffmpeg not found at: ${cfg.ffmpeg}. Please ensure ffmpeg is installed.`));
+      } else {
+        reject(spawnError);
+      }
+    });
     ff.on("close", (code) => {
       if (code === 0 && chunks.length) resolve(Buffer.concat(chunks));
       else reject(new Error(`ffmpeg exit ${code}: ${err.split("\n").slice(-3).join(" ")}`));

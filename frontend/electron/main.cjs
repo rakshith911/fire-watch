@@ -157,8 +157,90 @@ if (isDev) {
 const userDataPath = app.getPath("userData");
 const modelsPath = path.join(userDataPath, "models");
 const backendRootPath = path.join(userDataPath, "backend_bin"); // For binaries like mediamtx
+const versionFilePath = path.join(userDataPath, ".app_version");
 ensureDir(modelsPath);
 ensureDir(backendRootPath);
+
+// ✅ APP VERSION & BUILD ID - Used to trigger re-download when DMG is updated
+const APP_VERSION = "0.2.1";
+
+// Build ID is auto-generated at build time - forces re-download on every new DMG
+function getBuildId() {
+  // In production, read from bundled file. In dev, use "dev"
+  if (isDev) return "dev";
+
+  try {
+    const buildIdPath = path.join(__dirname, "build-id.txt");
+    if (fs.existsSync(buildIdPath)) {
+      return fs.readFileSync(buildIdPath, "utf8").trim();
+    }
+  } catch (e) {
+    mlog("Could not read build ID:", e.message);
+  }
+  return "unknown";
+}
+
+const BUILD_ID = getBuildId();
+
+// Check if build changed - if so, clear models to force re-download
+function checkVersionAndClearIfNeeded() {
+  let storedBuildId = null;
+
+  try {
+    if (fs.existsSync(versionFilePath)) {
+      storedBuildId = fs.readFileSync(versionFilePath, "utf8").trim();
+    }
+  } catch (e) {
+    mlog("Could not read version file:", e.message);
+  }
+
+  mlog(`📦 App version: ${APP_VERSION}, Build ID: ${BUILD_ID}, Stored Build ID: ${storedBuildId || "none"}`);
+
+  if (storedBuildId !== BUILD_ID) {
+    mlog("🔄 NEW BUILD DETECTED - Clearing old models to force re-download...");
+
+    // Delete all files in models directory
+    try {
+      if (fs.existsSync(modelsPath)) {
+        const files = fs.readdirSync(modelsPath);
+        for (const file of files) {
+          const filePath = path.join(modelsPath, file);
+          fs.unlinkSync(filePath);
+          mlog(`🗑️ Deleted: ${file}`);
+        }
+      }
+    } catch (e) {
+      mlog("Error clearing models:", e.message);
+    }
+
+    // Delete mediamtx binary (ffmpeg is bundled, not downloaded)
+    try {
+      const binaryName = process.platform === "win32" ? "mediamtx.exe" : "mediamtx";
+      const binaryPath = path.join(backendRootPath, binaryName);
+      if (fs.existsSync(binaryPath)) {
+        fs.unlinkSync(binaryPath);
+        mlog(`🗑️ Deleted: ${binaryName}`);
+      }
+    } catch (e) {
+      mlog("Error clearing binary:", e.message);
+    }
+
+    mlog("✅ Old resources cleared - will download fresh copies");
+    return true; // Version changed
+  }
+
+  return false; // Same version
+}
+
+// Save current build ID after successful download
+function saveVersion() {
+  try {
+    fs.writeFileSync(versionFilePath, BUILD_ID);
+    mlog(`💾 Saved build ID ${BUILD_ID} to ${versionFilePath}`);
+  } catch (e) {
+    mlog("Failed to save build ID:", e.message);
+  }
+}
 
 // ✅ AWS CONFIG
 // NOTE: Ideally these should be baked in or fetched securely. 
@@ -186,32 +268,73 @@ mlog("🔍 isDev:", isDev);
 mlog("🔍 app.isPackaged:", app.isPackaged);
 mlog("🔍 UserData Path:", userDataPath);
 
-// ✅ CHECK RESOURCES
+// ✅ CHECK RESOURCES - with file size validation
 async function checkResources() {
+  // Expected file sizes (in bytes) to validate downloads are complete
   const REQUIRED_FILES = [
-    "best.onnx",
-    "yolov11n_bestFire.onnx",
-    "theft.onnx",
-    "weapons.onnx",
-    "depth_anything_v2_small.onnx"
+    { name: "best.onnx", minSize: 130000000 },           // ~131MB
+    { name: "yolov11n_bestFire.onnx", minSize: 10000000 }, // ~10MB
+    { name: "theft.onnx", minSize: 12000000 },           // ~12MB
+    { name: "weapons.onnx", minSize: 130000000 },        // ~131MB
+    { name: "depth_anything_v2_small.onnx", minSize: 98000000 } // ~99MB
   ];
 
-  // Also check for mediamtx binary
-  const binaryName = process.platform === "win32" ? "mediamtx.exe" : "mediamtx";
+  // Also check for mediamtx binary (ffmpeg is bundled with the app)
+  const mediamtxName = process.platform === "win32" ? "mediamtx.exe" : "mediamtx";
 
   const missing = [];
 
-  // Check models
+  mlog("═══════════════════════════════════════════════════════════");
+  mlog("🔍 CHECKING RESOURCES");
+  mlog("═══════════════════════════════════════════════════════════");
+  mlog("Models path:", modelsPath);
+  mlog("Backend bin path:", backendRootPath);
+
+  // Check models - validate existence AND size
   for (const file of REQUIRED_FILES) {
-    if (!fs.existsSync(path.join(modelsPath, file))) {
-      missing.push({ type: "model", name: file });
+    const filePath = path.join(modelsPath, file.name);
+    const exists = fs.existsSync(filePath);
+
+    if (!exists) {
+      mlog(`❌ ${file.name} - MISSING`);
+      missing.push({ type: "model", name: file.name });
+    } else {
+      const stats = fs.statSync(filePath);
+      const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
+
+      if (stats.size < file.minSize) {
+        mlog(`⚠️ ${file.name} - CORRUPTED (${sizeMB}MB, expected >${(file.minSize/1024/1024).toFixed(0)}MB)`);
+        // Delete corrupted file so it gets re-downloaded
+        try {
+          fs.unlinkSync(filePath);
+          mlog(`🗑️ Deleted corrupted ${file.name}`);
+        } catch (e) {
+          mlog(`Failed to delete corrupted file: ${e.message}`);
+        }
+        missing.push({ type: "model", name: file.name });
+      } else {
+        mlog(`✅ ${file.name} - OK (${sizeMB}MB)`);
+      }
     }
   }
 
-  // Check binary
-  if (!fs.existsSync(path.join(backendRootPath, binaryName))) {
-    missing.push({ type: "binary", name: binaryName });
+  // Check mediamtx binary (ffmpeg is bundled with the app in backend/bin)
+  const mediamtxPath = path.join(backendRootPath, mediamtxName);
+  if (!fs.existsSync(mediamtxPath)) {
+    mlog(`❌ ${mediamtxName} - MISSING`);
+    missing.push({ type: "binary", name: mediamtxName });
+  } else {
+    const stats = fs.statSync(mediamtxPath);
+    mlog(`✅ ${mediamtxName} - OK (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
   }
+
+  mlog("═══════════════════════════════════════════════════════════");
+  if (missing.length > 0) {
+    mlog(`⚠️ ${missing.length} resources need to be downloaded`);
+  } else {
+    mlog("✅ All resources present and valid");
+  }
+  mlog("═══════════════════════════════════════════════════════════");
 
   return missing;
 }
@@ -253,12 +376,16 @@ async function downloadResources(missingFiles) {
       // 2. Stream to file
       await pipeline(response.Body, fs.createWriteStream(targetPath));
 
-      // 3. Make executable if binary
+      // 3. Verify download
+      const stats = fs.statSync(targetPath);
+      const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
+      mlog(`✅ Downloaded: ${file.name} (${sizeMB}MB)`);
+
+      // 4. Make executable if binary
       if (file.type === "binary" && process.platform !== "win32") {
         fs.chmodSync(targetPath, "755");
       }
 
-      mlog(`✅ Downloaded: ${file.name}`);
       current++;
 
     } catch (e) {
@@ -450,18 +577,100 @@ function startBackend() {
   mlog("Backend started. Logs:", LOG);
 }
 
+// ✅ Ensure bundled binaries have execute permissions
+function ensureBinaryPermissions() {
+  if (process.platform === "win32") return; // Not needed on Windows
+
+  const backendPath = isDev
+    ? path.join(__dirname, "../../backend")
+    : path.join(process.resourcesPath, "backend");
+
+  const binaries = [
+    path.join(backendPath, "bin", "ffmpeg"),
+    path.join(backendRootPath, "mediamtx") // Downloaded mediamtx
+  ];
+
+  for (const binPath of binaries) {
+    try {
+      if (fs.existsSync(binPath)) {
+        fs.chmodSync(binPath, "755");
+        mlog(`✅ Set execute permission: ${path.basename(binPath)}`);
+      }
+    } catch (e) {
+      mlog(`⚠️ Could not set permission for ${binPath}: ${e.message}`);
+    }
+  }
+}
+
+// ✅ Validate critical dependencies before starting
+function validateDependencies() {
+  const issues = [];
+
+  const backendPath = isDev
+    ? path.join(__dirname, "../../backend")
+    : path.join(process.resourcesPath, "backend");
+
+  // Check ffmpeg
+  const ffmpegPath = path.join(backendPath, "bin", "ffmpeg");
+  if (!fs.existsSync(ffmpegPath)) {
+    issues.push(`ffmpeg not found at: ${ffmpegPath}`);
+  }
+
+  // Check server.js
+  const serverPath = path.join(backendPath, "src", "server.js");
+  if (!fs.existsSync(serverPath)) {
+    issues.push(`Backend server not found at: ${serverPath}`);
+  }
+
+  // Check mediamtx (in app data)
+  const mediamtxPath = path.join(backendRootPath, process.platform === "win32" ? "mediamtx.exe" : "mediamtx");
+  if (!fs.existsSync(mediamtxPath)) {
+    issues.push(`mediamtx not found at: ${mediamtxPath}`);
+  }
+
+  if (issues.length > 0) {
+    mlog("❌ DEPENDENCY VALIDATION FAILED:");
+    issues.forEach(i => mlog(`   - ${i}`));
+    return false;
+  }
+
+  mlog("✅ All dependencies validated");
+  return true;
+}
+
 app.whenReady().then(async () => {
+  // 0. Check if version changed - clear old models if so
+  const versionChanged = checkVersionAndClearIfNeeded();
+
   // 1. Check & Download Resources
   const missing = await checkResources();
   if (missing.length > 0) {
     mlog("⚠️ Missing resources:", missing);
     const success = await downloadResources(missing);
     if (!success) return; // Exit if failed
+
+    // Save version after successful download
+    saveVersion();
   } else {
     mlog("✅ All resources present.");
+    // Still save version in case it wasn't saved before
+    saveVersion();
   }
 
-  // 2. Start App
+  // 2. Set binary permissions
+  ensureBinaryPermissions();
+
+  // 3. Validate all dependencies
+  if (!validateDependencies()) {
+    dialog.showErrorBox(
+      "FireAI Setup Error",
+      "Some required files are missing. Please reinstall the application.\n\nCheck logs at: " + LOG.dir
+    );
+    app.quit();
+    return;
+  }
+
+  // 4. Start App
   createWindow();
   startBackend();
 
