@@ -81,6 +81,86 @@ function grabFrameOnce(srcUrl) {
   });
 }
 
+/**
+ * Grab multiple frames from a SINGLE ffmpeg connection.
+ * This avoids the keyframe/GOP problem where separate connections
+ * always start at the same I-frame, producing identical images.
+ * Uses fps filter to space frames ~1s apart within a short capture window.
+ */
+function grabMultipleFrames(srcUrl, numFrames = 3) {
+  return new Promise((resolve, reject) => {
+    const isRtsp = srcUrl.startsWith("rtsp://");
+    const args = ["-y"];
+
+    if (isRtsp) {
+      args.push(
+        "-rtsp_transport", "tcp",
+        "-timeout", "5000000",
+        "-analyzeduration", "1000000",
+        "-probesize", "1000000"
+      );
+    }
+
+    // Read stream for a few seconds, output 1 frame per second
+    const duration = numFrames + 1; // e.g. 4 seconds for 3 frames
+    args.push(
+      "-i", srcUrl,
+      "-t", String(duration),
+      "-vf", `fps=1`,
+      "-frames:v", String(numFrames),
+      "-q:v", "2",
+      "-f", "image2",
+      "-update", "1",
+      "pipe:1"
+    );
+
+    log.debug({ ffmpegPath: cfg.ffmpeg, numFrames, duration }, "Spawning ffmpeg (multi-frame)");
+
+    const ff = spawn(cfg.ffmpeg, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+    // JPEG frames are concatenated in stdout - split by JPEG markers
+    const allData = [];
+    let err = "";
+
+    ff.stdout.on("data", (d) => allData.push(d));
+    ff.stderr.on("data", (d) => (err += d.toString()));
+    ff.on("error", (spawnError) => {
+      if (spawnError.code === "ENOENT") {
+        log.error({ ffmpegPath: cfg.ffmpeg }, "❌ FFMPEG NOT FOUND");
+        reject(new Error(`ffmpeg not found at: ${cfg.ffmpeg}. Please ensure ffmpeg is installed.`));
+      } else {
+        reject(spawnError);
+      }
+    });
+    ff.on("close", (code) => {
+      if (code !== 0 && allData.length === 0) {
+        reject(new Error(`ffmpeg exit ${code}: ${err.split("\n").slice(-3).join(" ")}`));
+        return;
+      }
+
+      const fullBuffer = Buffer.concat(allData);
+      // Split concatenated JPEGs by SOI marker (FF D8)
+      const frames = [];
+      let start = 0;
+      for (let i = 0; i < fullBuffer.length - 1; i++) {
+        if (fullBuffer[i] === 0xFF && fullBuffer[i + 1] === 0xD8 && i > start) {
+          frames.push(fullBuffer.subarray(start, i));
+          start = i;
+        }
+      }
+      if (start < fullBuffer.length) {
+        frames.push(fullBuffer.subarray(start));
+      }
+
+      // Filter out any tiny/corrupt fragments
+      const validFrames = frames.filter(f => f.length > 1000);
+
+      log.info({ requested: numFrames, extracted: validFrames.length }, "📸 Multi-frame extraction complete");
+      resolve(validFrames);
+    });
+  });
+}
+
 // -------------------------------------------------------------------
 // 🔄 Image Preprocessing (Canvas → Sharp)
 // -------------------------------------------------------------------
@@ -367,6 +447,58 @@ export async function detectFire(cameraUrl, cameraName) {
       error: error.message,
       frameBuffer: null,
     };
+  }
+}
+
+/**
+ * Detect fire across multiple frames from a SINGLE ffmpeg connection.
+ * Solves the keyframe/GOP problem where cameras with long GOP intervals
+ * return the same frame on every separate connection.
+ */
+export async function detectFireMultiFrame(cameraUrl, cameraName, numFrames = 3) {
+  try {
+    const jpegBuffers = await grabMultipleFrames(cameraUrl, numFrames);
+
+    const results = [];
+    for (let i = 0; i < jpegBuffers.length; i++) {
+      const jpegBuffer = jpegBuffers[i];
+      const { tensor, originalWidth, originalHeight, scale, padX, padY } = await prepareInput(jpegBuffer, 640);
+      const outputs = await runInference(tensor);
+      const result = processOutput(outputs, originalWidth, originalHeight, scale, padX, padY);
+
+      log.info({
+        camera: cameraName,
+        frame: `${i + 1}/${jpegBuffers.length}`,
+        jpegSize: `${(jpegBuffer.length / 1024).toFixed(1)}KB`,
+        resolution: `${originalWidth}x${originalHeight}`,
+        detected: result.detected,
+        fireCount: result.fireCount,
+        smokeCount: result.smokeCount,
+        topScore: result.boxes.length > 0 ? result.boxes[0][5].toFixed(4) : "none",
+      }, `🔥 LOCAL: Multi-frame ${i + 1} inference result`);
+
+      results.push({
+        isFire: result.detected,
+        confidence: result.boxes.length > 0 ? result.boxes[0][5] : 0,
+        boxes: result.boxes,
+        fireCount: result.fireCount,
+        smokeCount: result.smokeCount,
+        frameBuffer: jpegBuffer,
+      });
+    }
+
+    log.info({
+      camera: cameraName,
+      framesExtracted: jpegBuffers.length,
+      framesWithFire: results.filter(r => r.isFire).length,
+    }, "🔥 LOCAL: Multi-frame detection complete");
+
+    return results;
+  } catch (error) {
+    log.error({ camera: cameraName, error: error.message }, "🔥 LOCAL: Multi-frame detection failed, falling back to single-frame");
+    // Fallback: return single frame result
+    const single = await detectFire(cameraUrl, cameraName);
+    return [single];
   }
 }
 

@@ -1,5 +1,5 @@
 import pino from "pino";
-import { detectFire, buildCameraUrl } from "./localDetector.js";
+import { detectFire, detectFireMultiFrame, buildCameraUrl } from "./localDetector.js";
 import { detectFireCloud } from "./cloudDetector.js";
 import { detectWeapon } from "./localWeaponDetector.js";
 import livenessValidator from "./livenessValidator.js";
@@ -195,64 +195,19 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
     `📸 Extracting ${FRAMES_PER_CHECK} frames for LOCAL ${aiType} analysis...`
   );
 
-  for (let i = 0; i < FRAMES_PER_CHECK; i++) {
+  // ---------------------------------------------------------------
+  // 🔥 FIRE or BOTH: Use single-connection multi-frame extraction
+  // This fixes the keyframe/GOP problem where cameras with long GOP
+  // intervals return the same I-frame on every separate connection,
+  // causing false "static" detections.
+  // ---------------------------------------------------------------
+  if (aiType === "FIRE" || aiType === "BOTH") {
     try {
-      if (aiType === "BOTH") {
-        // Run both fire and weapon detection on the same frame source
-        const fireResult = await detectFire(cameraUrl, camera.name);
-        const weaponResult = await detectWeapon(cameraUrl, camera.name);
+      const fireResults = await detectFireMultiFrame(cameraUrl, camera.name, FRAMES_PER_CHECK);
 
-        if (fireResult.isFire) {
-          frames.push({
-            timestamp: new Date().toISOString(),
-            boxes: fireResult.boxes.map((b) => [b[0], b[1], b[2], b[3], b[4], b[5]]),
-            fireCount: fireResult.fireCount || 0,
-            smokeCount: fireResult.smokeCount || 0,
-            confidence: fireResult.confidence,
-            frameBuffer: fireResult.frameBuffer,
-            aiType: "FIRE"
-          });
-          log.info(
-            { id: camera.id, name: camera.name, frameNumber: i + 1, boxes: fireResult.boxes.length },
-            `🔥 BOTH Frame ${i + 1}/${FRAMES_PER_CHECK}: Fire detected`
-          );
-        }
-
-        if (weaponResult.isWeapon) {
-          frames.push({
-            timestamp: new Date().toISOString(),
-            boxes: weaponResult.boxes.map((b) => [b[0], b[1], b[2], b[3], b[4], b[5]]),
-            fireCount: 0,
-            smokeCount: 0,
-            confidence: weaponResult.confidence,
-            frameBuffer: weaponResult.frameBuffer,
-            aiType: "WEAPON"
-          });
-          log.info(
-            { id: camera.id, name: camera.name, frameNumber: i + 1, boxes: weaponResult.boxes.length },
-            `🔫 BOTH Frame ${i + 1}/${FRAMES_PER_CHECK}: Weapon detected`
-          );
-        }
-
-        if (!fireResult.isFire && !weaponResult.isWeapon) {
-          log.info(
-            { id: camera.id, name: camera.name, frameNumber: i + 1 },
-            `✅ BOTH Frame ${i + 1}/${FRAMES_PER_CHECK}: No detection`
-          );
-        }
-      } else {
-        let result;
-        if (aiType === "WEAPON") {
-          result = await detectWeapon(cameraUrl, camera.name);
-        } else {
-          // Default to FIRE (LOCAL)
-          result = await detectFire(cameraUrl, camera.name);
-        }
-
-        // Normalize result structure
-        const isDetected = result.isFire || result.isWeapon;
-
-        if (isDetected) {
+      for (let i = 0; i < fireResults.length; i++) {
+        const result = fireResults[i];
+        if (result.isFire) {
           frames.push({
             timestamp: new Date().toISOString(),
             boxes: result.boxes.map((b) => [b[0], b[1], b[2], b[3], b[4], b[5]]),
@@ -260,47 +215,64 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
             smokeCount: result.smokeCount || 0,
             confidence: result.confidence,
             frameBuffer: result.frameBuffer,
-            aiType
+            aiType: "FIRE"
           });
-
-          const detectedLabel = result.boxes.length > 0 ? result.boxes[0][4] : "Object";
-          const prefix = aiType === "WEAPON" ? "🔫 WEAPON" : "🔥 LOCAL";
-
           log.info(
-            {
-              id: camera.id,
-              name: camera.name,
-              frameNumber: i + 1,
-              boxes: result.boxes.length,
-              firstBox: result.boxes.length > 0 ? result.boxes[0] : null,
-            },
-            `${prefix} Frame ${i + 1}/${FRAMES_PER_CHECK}: ${detectedLabel} detected`
+            { id: camera.id, name: camera.name, frameNumber: i + 1, boxes: result.boxes.length },
+            `🔥 LOCAL Frame ${i + 1}/${fireResults.length}: Fire detected`
           );
         } else {
-          const prefix = aiType === "WEAPON" ? "✅ WEAPON" : "✅ LOCAL";
           log.info(
-            {
-              id: camera.id,
-              name: camera.name,
-              frameNumber: i + 1,
-            },
-            `${prefix} Frame ${i + 1}/${FRAMES_PER_CHECK}: No detection`
+            { id: camera.id, name: camera.name, frameNumber: i + 1 },
+            `✅ LOCAL Frame ${i + 1}/${fireResults.length}: No fire`
           );
         }
       }
-
-      if (i < FRAMES_PER_CHECK - 1) {
-        await new Promise((r) => setTimeout(r, frameInterval));
-      }
     } catch (error) {
       log.error(
-        {
-          id: camera.id,
-          name: camera.name,
-          error: error.message,
-        },
-        `❌ ${aiType} Detection error - skipping frame`
+        { id: camera.id, name: camera.name, error: error.message },
+        `❌ FIRE multi-frame detection error`
       );
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // 🔫 WEAPON or BOTH: Weapon detection (separate connections OK -
+  // weapon detection doesn't rely on motion between frames as much)
+  // ---------------------------------------------------------------
+  if (aiType === "WEAPON" || aiType === "BOTH") {
+    for (let i = 0; i < FRAMES_PER_CHECK; i++) {
+      try {
+        const result = await detectWeapon(cameraUrl, camera.name);
+        if (result.isWeapon) {
+          frames.push({
+            timestamp: new Date().toISOString(),
+            boxes: result.boxes.map((b) => [b[0], b[1], b[2], b[3], b[4], b[5]]),
+            fireCount: 0,
+            smokeCount: 0,
+            confidence: result.confidence,
+            frameBuffer: result.frameBuffer,
+            aiType: "WEAPON"
+          });
+          log.info(
+            { id: camera.id, name: camera.name, frameNumber: i + 1, boxes: result.boxes.length },
+            `🔫 WEAPON Frame ${i + 1}/${FRAMES_PER_CHECK}: Weapon detected`
+          );
+        } else {
+          log.info(
+            { id: camera.id, name: camera.name, frameNumber: i + 1 },
+            `✅ WEAPON Frame ${i + 1}/${FRAMES_PER_CHECK}: No weapon`
+          );
+        }
+        if (i < FRAMES_PER_CHECK - 1) {
+          await new Promise((r) => setTimeout(r, frameInterval));
+        }
+      } catch (error) {
+        log.error(
+          { id: camera.id, name: camera.name, error: error.message },
+          `❌ WEAPON Detection error - skipping frame`
+        );
+      }
     }
   }
 
