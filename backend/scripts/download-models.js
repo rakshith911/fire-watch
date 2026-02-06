@@ -65,9 +65,15 @@ async function main() {
             return;
         }
 
+        const allowedModels = ["best.onnx", "weapons.onnx", "depth_anything_v2_small.onnx"];
+
         for (const item of data.Contents) {
             const fileName = item.Key;
             if (!fileName.endsWith(".onnx")) continue;
+            if (!allowedModels.includes(fileName)) {
+                console.log(`⏭️ Skipping ${fileName} (not in allowed models list)`);
+                continue;
+            }
 
             const filePath = path.join(MODELS_DIR, fileName);
 

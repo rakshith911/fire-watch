@@ -48,9 +48,6 @@ export async function sendFireAlert(
     if (type === "WEAPON") {
       emoji = "🔫";
       title = "Weapon Alert";
-    } else if (type === "THEFT") {
-      emoji = "🕵️";
-      title = "Theft Detection Alert";
     }
 
     const message = `

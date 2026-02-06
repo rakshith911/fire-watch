@@ -628,10 +628,8 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                                 disabled={updatingAiType.has(c.id)}
                               >
                                 <option value="FIRE">🔥 Fire Detect</option>
-                                <option value="THEFT">🕵️ Theft Detection</option>
-                                <option value="CROWD_DENSITY">👥 Crowd Detect</option>
-                                <option value="ANONYMIZATION">🕶️ Blur Faces</option>
                                 <option value="WEAPON">🔫 Weapon Detect</option>
+                                <option value="BOTH">🔥🔫 Fire + Weapons</option>
                               </select>
                             </div>
                           </div>

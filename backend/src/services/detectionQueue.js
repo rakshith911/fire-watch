@@ -2,7 +2,6 @@ import pino from "pino";
 import { detectFire, buildCameraUrl } from "./localDetector.js";
 import { detectFireCloud } from "./cloudDetector.js";
 import { detectWeapon } from "./localWeaponDetector.js";
-import { detectTheft } from "./localTheftDetector.js";
 import livenessValidator from "./livenessValidator.js";
 import {
   startCameraStream,
@@ -180,7 +179,7 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
     }
   }
 
-  // aiType determines WHAT to detect (FIRE, WEAPON, THEFT)
+  // aiType determines WHAT to detect (FIRE, WEAPON, BOTH)
   const aiType = (camera.aiType || "FIRE").toUpperCase();
 
   log.info(
@@ -198,53 +197,96 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
 
   for (let i = 0; i < FRAMES_PER_CHECK; i++) {
     try {
-      let result;
-      if (aiType === "WEAPON") {
-        result = await detectWeapon(cameraUrl, camera.name);
-      } else if (aiType === "THEFT") {
-        result = await detectTheft(cameraUrl, camera.name);
+      if (aiType === "BOTH") {
+        // Run both fire and weapon detection on the same frame source
+        const fireResult = await detectFire(cameraUrl, camera.name);
+        const weaponResult = await detectWeapon(cameraUrl, camera.name);
+
+        if (fireResult.isFire) {
+          frames.push({
+            timestamp: new Date().toISOString(),
+            boxes: fireResult.boxes.map((b) => [b[0], b[1], b[2], b[3], b[4], b[5]]),
+            fireCount: fireResult.fireCount || 0,
+            smokeCount: fireResult.smokeCount || 0,
+            confidence: fireResult.confidence,
+            frameBuffer: fireResult.frameBuffer,
+            aiType: "FIRE"
+          });
+          log.info(
+            { id: camera.id, name: camera.name, frameNumber: i + 1, boxes: fireResult.boxes.length },
+            `🔥 BOTH Frame ${i + 1}/${FRAMES_PER_CHECK}: Fire detected`
+          );
+        }
+
+        if (weaponResult.isWeapon) {
+          frames.push({
+            timestamp: new Date().toISOString(),
+            boxes: weaponResult.boxes.map((b) => [b[0], b[1], b[2], b[3], b[4], b[5]]),
+            fireCount: 0,
+            smokeCount: 0,
+            confidence: weaponResult.confidence,
+            frameBuffer: weaponResult.frameBuffer,
+            aiType: "WEAPON"
+          });
+          log.info(
+            { id: camera.id, name: camera.name, frameNumber: i + 1, boxes: weaponResult.boxes.length },
+            `🔫 BOTH Frame ${i + 1}/${FRAMES_PER_CHECK}: Weapon detected`
+          );
+        }
+
+        if (!fireResult.isFire && !weaponResult.isWeapon) {
+          log.info(
+            { id: camera.id, name: camera.name, frameNumber: i + 1 },
+            `✅ BOTH Frame ${i + 1}/${FRAMES_PER_CHECK}: No detection`
+          );
+        }
       } else {
-        // Default to FIRE (LOCAL)
-        result = await detectFire(cameraUrl, camera.name);
-      }
+        let result;
+        if (aiType === "WEAPON") {
+          result = await detectWeapon(cameraUrl, camera.name);
+        } else {
+          // Default to FIRE (LOCAL)
+          result = await detectFire(cameraUrl, camera.name);
+        }
 
-      // Normalize result structure
-      const isDetected = result.isFire || result.isWeapon || result.isTheft;
+        // Normalize result structure
+        const isDetected = result.isFire || result.isWeapon;
 
-      if (isDetected) {
-        frames.push({
-          timestamp: new Date().toISOString(),
-          boxes: result.boxes.map((b) => [b[0], b[1], b[2], b[3], b[4], b[5]]),
-          fireCount: result.fireCount || 0,
-          smokeCount: result.smokeCount || 0,
-          confidence: result.confidence,
-          frameBuffer: result.frameBuffer,
-          aiType // Store type for later
-        });
+        if (isDetected) {
+          frames.push({
+            timestamp: new Date().toISOString(),
+            boxes: result.boxes.map((b) => [b[0], b[1], b[2], b[3], b[4], b[5]]),
+            fireCount: result.fireCount || 0,
+            smokeCount: result.smokeCount || 0,
+            confidence: result.confidence,
+            frameBuffer: result.frameBuffer,
+            aiType
+          });
 
-        const detectedLabel = result.boxes.length > 0 ? result.boxes[0][4] : "Object";
-        const prefix = aiType === "WEAPON" ? "🔫 WEAPON" : aiType === "THEFT" ? "🕵️ THEFT" : "🔥 LOCAL";
+          const detectedLabel = result.boxes.length > 0 ? result.boxes[0][4] : "Object";
+          const prefix = aiType === "WEAPON" ? "🔫 WEAPON" : "🔥 LOCAL";
 
-        log.info(
-          {
-            id: camera.id,
-            name: camera.name,
-            frameNumber: i + 1,
-            boxes: result.boxes.length,
-            firstBox: result.boxes.length > 0 ? result.boxes[0] : null,
-          },
-          `${prefix} Frame ${i + 1}/${FRAMES_PER_CHECK}: ${detectedLabel} detected`
-        );
-      } else {
-        const prefix = aiType === "WEAPON" ? "✅ WEAPON" : aiType === "THEFT" ? "✅ THEFT" : "✅ LOCAL";
-        log.info(
-          {
-            id: camera.id,
-            name: camera.name,
-            frameNumber: i + 1,
-          },
-          `${prefix} Frame ${i + 1}/${FRAMES_PER_CHECK}: No detection`
-        );
+          log.info(
+            {
+              id: camera.id,
+              name: camera.name,
+              frameNumber: i + 1,
+              boxes: result.boxes.length,
+              firstBox: result.boxes.length > 0 ? result.boxes[0] : null,
+            },
+            `${prefix} Frame ${i + 1}/${FRAMES_PER_CHECK}: ${detectedLabel} detected`
+          );
+        } else {
+          const prefix = aiType === "WEAPON" ? "✅ WEAPON" : "✅ LOCAL";
+          log.info(
+            {
+              id: camera.id,
+              name: camera.name,
+              frameNumber: i + 1,
+            },
+            `${prefix} Frame ${i + 1}/${FRAMES_PER_CHECK}: No detection`
+          );
+        }
       }
 
       if (i < FRAMES_PER_CHECK - 1) {
@@ -512,20 +554,20 @@ async function startQueueLoop() {
         cameraQueue.length
       );
       const currentFrameInterval = calculateFrameInterval(currentCameraInterval);
-      // aiType = WHAT to detect (FIRE, WEAPON, THEFT)
+      // aiType = WHAT to detect (FIRE, WEAPON, BOTH)
       // detection = HOW to detect for FIRE (LOCAL, CLOUD)
       const aiType = (camera.aiType || "FIRE").toUpperCase();
       const detectionMethod = (camera.detection || "LOCAL").toUpperCase();
 
       // For FIRE, check if using CLOUD or LOCAL method
-      // For WEAPON/THEFT, always use local (they don't have cloud endpoints)
+      // For WEAPON/BOTH, always use local (they don't have cloud endpoints)
       let detectionType;
       if (aiType === "FIRE" && detectionMethod === "CLOUD") {
         detectionType = "CLOUD";
       } else if (aiType === "WEAPON") {
         detectionType = "WEAPON";
-      } else if (aiType === "THEFT") {
-        detectionType = "THEFT";
+      } else if (aiType === "BOTH") {
+        detectionType = "BOTH";
       } else {
         // Default: LOCAL fire detection
         detectionType = "LOCAL";
@@ -551,7 +593,7 @@ async function startQueueLoop() {
         // Cloud detection - IoU is handled in the cloud endpoint
         frames = await extractMultipleFramesCloud(camera);
       } else {
-        // LOCAL, WEAPON, or THEFT
+        // LOCAL, WEAPON, or BOTH
         frames = await extractMultipleFramesLocal(camera, currentFrameInterval);
       }
 
@@ -646,29 +688,52 @@ async function startQueueLoop() {
           } else {
             log.warn({ framesDetected: framesWithBoxes.length }, "⚠️ WEAPON: Not enough frames with detection");
           }
-        } else if (detectionType === "THEFT") {
-          // 🕵️ THEFT: Check Motion (IoU) AND Depth (Real Person vs Poster)
-          iouAnalysis = analyzeBoxes(frames);
+        } else if (detectionType === "BOTH") {
+          // 🔥🔫 BOTH: Frames are tagged with aiType "FIRE" or "WEAPON"
+          // Separate them and validate each type independently
+          const fireFrames = frames.filter(f => f.aiType === "FIRE");
+          const weaponFrames = frames.filter(f => f.aiType === "WEAPON");
 
-          if (!iouAnalysis.isStatic) {
-            // It's moving, now check if it's a flat video playback/poster
-            const lastFrame = frames[frames.length - 1];
-            const bbox = lastFrame.boxes[0];
-
-            // Reuse the 3D depth check (works for any object, not just weapons)
-            const is3D = await livenessValidator.isWeapon3D(lastFrame.frameBuffer, bbox);
-
-            if (is3D) {
-              isRealDetection = true;
-              log.info("🕵️ THEFT: Liveness Check PASSED (Moving + 3D)");
-            } else {
-              log.warn("⚠️ THEFT: Liveness Check FAILED (Moving but 2D/Flat - Video?) - Ignoring");
+          if (fireFrames.length >= 2) {
+            const fireIou = analyzeBoxes(fireFrames);
+            if (!fireIou.isStatic) {
+              const lastFire = fireFrames[fireFrames.length - 1];
+              const bbox = lastFire.boxes[0];
+              const frameBuffers = fireFrames.map(f => f.frameBuffer);
+              const isFlickering = await livenessValidator.isFireMoving(frameBuffers, bbox);
+              if (isFlickering) {
+                isRealDetection = true;
+                iouAnalysis = fireIou;
+                // Override detectionType for the alert
+                frames._fireConfirmed = true;
+                log.info("🔥 BOTH/FIRE: Liveness Check PASSED (Flickering Motion)");
+              } else {
+                log.warn("⚠️ BOTH/FIRE: Liveness Check FAILED (Static Pixels)");
+              }
             }
-          } else {
-            log.warn(
-              { ...iouAnalysis },
-              `⚠️ STATIC THEFT DETECTED (IoU ${iouAnalysis.avgIoU} > ${BOX_IOU_THRESHOLD}) - Likely poster`
-            );
+          }
+
+          if (weaponFrames.length >= 2) {
+            const weaponIou = analyzeBoxes(weaponFrames);
+            const avgIoU = parseFloat(weaponIou.avgIoU || "0");
+            const framesWithBoxes = weaponFrames.filter(f => f.boxes && f.boxes.length > 0);
+            const maxConfidence = Math.max(...framesWithBoxes.map(f => f.boxes[0][5]));
+            const hasMovement = avgIoU < 0.95;
+            const highConfidence = maxConfidence > 0.5;
+
+            const lastWeapon = framesWithBoxes[framesWithBoxes.length - 1];
+            const bbox = lastWeapon.boxes[0];
+            const is3D = await livenessValidator.isWeapon3D(lastWeapon.frameBuffer, bbox);
+
+            if (hasMovement || highConfidence || is3D) {
+              isRealDetection = true;
+              iouAnalysis = iouAnalysis || weaponIou;
+              frames._weaponConfirmed = true;
+              const reason = hasMovement ? 'Movement detected' : (highConfidence ? 'High confidence' : '3D depth detected');
+              log.info(`🔫 BOTH/WEAPON: Liveness PASSED (${reason})`);
+            } else {
+              log.warn("⚠️ BOTH/WEAPON: Liveness FAILED (Static + Low confidence + 2D flat)");
+            }
           }
         } else {
           // 🔥 FIRE: Perform IoU check AND Pixel Motion check
@@ -697,13 +762,19 @@ async function startQueueLoop() {
         }
 
         if (isRealDetection) {
+          // For BOTH mode, determine the specific alert type(s)
+          const alertType = detectionType === "BOTH"
+            ? (frames._fireConfirmed ? "FIRE" : "WEAPON")
+            : detectionType;
+
           log.error(
             {
               id: camera.id,
               name: camera.name,
-              detectionType
+              detectionType,
+              alertType
             },
-            `🚨 REAL ${detectionType} DETECTED - Broadcasting alert`
+            `🚨 REAL ${alertType} DETECTED - Broadcasting alert`
           );
 
           state.isFire = true; // Used for UI status (red border)
@@ -729,7 +800,7 @@ async function startQueueLoop() {
                 camera.name,
                 {
                   isFire: true,
-                  detectionType, // Add type to alert
+                  detectionType: alertType, // Send specific type (FIRE or WEAPON), not "BOTH"
                   confidence: lastFrame.confidence,
                   fireCount: lastFrame.fireCount,
                   smokeCount: lastFrame.smokeCount,
@@ -738,7 +809,7 @@ async function startQueueLoop() {
                 imageUrl
               );
 
-              log.info("✅ SNS alert with image sent successfully");
+              log.info(`✅ SNS ${alertType} alert with image sent successfully`);
             } catch (error) {
               log.error(
                 {

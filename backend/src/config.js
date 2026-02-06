@@ -62,10 +62,6 @@ export const cfg = {
   // AI Type endpoints - maps AI types to their respective AWS Lambda endpoints
   aiTypeEndpoints: {
     FIRE: process.env.FIRE_ENDPOINT,
-    INTRUSION: process.env.INTRUSION_ENDPOINT,
-    CROWD_DENSITY: process.env.CROWD_DENSITY_ENDPOINT,
-    ANONYMIZATION: process.env.ANONYMIZATION_ENDPOINT,
-    WEAPON: process.env.WEAPON_ENDPOINT,
   },
 
   port: Number(process.env.PORT || 4000),

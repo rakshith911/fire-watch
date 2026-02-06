@@ -340,7 +340,6 @@ function checkModelsAtStartup() {
   const requiredModels = [
     { name: "best.onnx", purpose: "Fire Detection" },
     { name: "weapons.onnx", purpose: "Weapon Detection" },
-    { name: "theft.onnx", purpose: "Theft Detection" },
     { name: "depth_anything_v2_small.onnx", purpose: "Liveness/Depth Check" },
   ];
 

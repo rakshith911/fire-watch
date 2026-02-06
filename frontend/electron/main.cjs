@@ -273,8 +273,6 @@ async function checkResources() {
   // Expected file sizes (in bytes) to validate downloads are complete
   const REQUIRED_FILES = [
     { name: "best.onnx", minSize: 130000000 },           // ~131MB
-    { name: "yolov11n_bestFire.onnx", minSize: 10000000 }, // ~10MB
-    { name: "theft.onnx", minSize: 12000000 },           // ~12MB
     { name: "weapons.onnx", minSize: 130000000 },        // ~131MB
     { name: "depth_anything_v2_small.onnx", minSize: 98000000 } // ~99MB
   ];
@@ -318,7 +316,7 @@ async function checkResources() {
     }
   }
 
-  // Check mediamtx binary (ffmpeg is bundled with the app in backend/bin)
+  // Check mediamtx binary
   const mediamtxPath = path.join(backendRootPath, mediamtxName);
   if (!fs.existsSync(mediamtxPath)) {
     mlog(`❌ ${mediamtxName} - MISSING`);
@@ -326,6 +324,25 @@ async function checkResources() {
   } else {
     const stats = fs.statSync(mediamtxPath);
     mlog(`✅ ${mediamtxName} - OK (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+  }
+
+  // Check ffmpeg - first check bundled location, then app data fallback
+  const ffmpegName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  const backendPath = isDev
+    ? path.join(__dirname, "../../backend")
+    : path.join(process.resourcesPath, "backend");
+  const bundledFfmpeg = path.join(backendPath, "bin", ffmpegName);
+  const fallbackFfmpeg = path.join(backendRootPath, ffmpegName);
+
+  if (fs.existsSync(bundledFfmpeg)) {
+    const stats = fs.statSync(bundledFfmpeg);
+    mlog(`✅ ${ffmpegName} (bundled) - OK (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+  } else if (fs.existsSync(fallbackFfmpeg)) {
+    const stats = fs.statSync(fallbackFfmpeg);
+    mlog(`✅ ${ffmpegName} (downloaded) - OK (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+  } else {
+    mlog(`❌ ${ffmpegName} - MISSING (not bundled, will download)`);
+    missing.push({ type: "binary", name: ffmpegName });
   }
 
   mlog("═══════════════════════════════════════════════════════════");
@@ -501,7 +518,14 @@ function startBackend() {
   const serverEntry = path.join(backendSrcPath, "src", "server.js");
   const args = isDev ? ["run", "dev"] : [serverEntry];
 
+  // Resolve ffmpeg: bundled first, then downloaded fallback
+  const ffmpegName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  const bundledFfmpeg = path.join(backendSrcPath, "bin", ffmpegName);
+  const fallbackFfmpeg = path.join(backendRootPath, ffmpegName);
+  const resolvedFfmpeg = fs.existsSync(bundledFfmpeg) ? bundledFfmpeg : fallbackFfmpeg;
+
   mlog("🔍 Starting backend from:", backendSrcPath);
+  mlog("🔍 FFMPEG_BIN:", resolvedFfmpeg, fs.existsSync(resolvedFfmpeg) ? "✅ EXISTS" : "❌ MISSING");
   mlog("🔍 Command:", command, args.join(" "));
 
   // ✅ FIX: Build proper PATH with common binary locations
@@ -529,7 +553,8 @@ function startBackend() {
     PORT: "4000",
     // DIRECTORY OVERRIDES
     MODELS_DIR_OVERRIDE: modelsPath,
-    MEDIAMTX_DIR_OVERRIDE: backendRootPath
+    MEDIAMTX_DIR_OVERRIDE: backendRootPath,
+    FFMPEG_BIN: resolvedFfmpeg
   };
 
   // ✅ CLEANUP: Kill any zombie process on port 4000 before starting
