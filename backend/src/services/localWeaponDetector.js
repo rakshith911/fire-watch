@@ -169,7 +169,7 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
 
     const numQueries = 300;
     const stride = 6;  // RT-DETR format: [x1, y1, x2, y2, conf, class_id]
-    const probThreshold = 0.5;  // Lowered from 0.65 for testing
+    const probThreshold = 0.35;  // Lowered from 0.5 - model often scores real knives 0.3-0.5
 
     // Verify data length
     const expectedLength = numQueries * stride;

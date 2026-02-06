@@ -611,6 +611,46 @@ body {
   gap: 2px;
 }
 
+.signout-wrapper button {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--on-surface);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.signout-wrapper button:hover {
+  background: color-mix(in oklab, var(--error) 15%, var(--surface-1));
+  border-color: var(--error);
+  color: var(--error);
+  transform: translateY(-1px);
+}
+
+.signout-wrapper button:active {
+  transform: translateY(0);
+  background: color-mix(in oklab, var(--error) 25%, var(--surface-1));
+}
+
+[data-theme="dark"] .signout-wrapper button {
+  background: #44475a;
+  border-color: #6272a4;
+  color: #f8f8f2;
+}
+
+[data-theme="dark"] .signout-wrapper button:hover {
+  background: rgba(255, 85, 85, 0.2);
+  border-color: #ff5555;
+  color: #ff5555;
+}
+
+[data-theme="dark"] .signout-wrapper button:active {
+  background: rgba(255, 85, 85, 0.3);
+}
+
 .version-text {
   font-size: 10px;
   color: var(--primary);
@@ -2094,8 +2134,8 @@ body {
 
 .modern-table-header {
   display: grid;
-  grid-template-columns: 1fr 0.9fr 1fr 0.7fr 0.7fr 0.7fr 0.8fr 1fr 1.2fr 0.9fr; /* Name, Location, IP, Port, View, Stream, Fire, Detection, AI Type, Actions */
-  gap: 12px;
+  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.5fr 0.8fr 1fr 0.8fr; /* Name, Location, IP, Port, Username, Password, StreamPath, View, Stream, Fire, Detection, AI Type, Actions */
+  gap: 10px;
   padding: 16px 20px;
   background: transparent;
   border-bottom: 2px solid var(--border);
@@ -2121,8 +2161,8 @@ body {
 
 .modern-table-row {
   display: grid;
-  grid-template-columns: 1fr 0.9fr 1fr 0.7fr 0.7fr 0.7fr 0.8fr 1fr 1.2fr 0.9fr; /* Name, Location, IP, Port, View, Stream, Fire, Detection, AI Type, Actions */
-  gap: 12px;
+  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.5fr 0.8fr 1fr 0.8fr; /* Name, Location, IP, Port, Username, Password, StreamPath, View, Stream, Fire, Detection, AI Type, Actions */
+  gap: 10px;
   padding: 18px 20px;
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -2326,6 +2366,53 @@ body {
 
 .edit-input::placeholder {
   color: var(--muted-2);
+}
+
+/* Password input wrapper */
+.password-input-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+}
+
+.password-input-wrapper .edit-input {
+  flex: 1;
+  padding-right: 8px;
+}
+
+.password-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.password-toggle-btn:hover {
+  background: var(--surface-2);
+  border-color: var(--secondary);
+  color: var(--secondary);
+}
+
+[data-theme="dark"] .password-toggle-btn {
+  background: #44475a;
+  border-color: #6272a4;
+  color: #6272a4;
+}
+
+[data-theme="dark"] .password-toggle-btn:hover {
+  background: #6272a4;
+  border-color: #8be9fd;
+  color: #8be9fd;
 }
 
 /* Delete animation */

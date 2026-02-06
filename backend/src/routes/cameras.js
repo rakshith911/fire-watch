@@ -293,6 +293,23 @@ cameras.put("/:id", async (req, res) => {
       );
     }
 
+    // 🔄 Restart MediaMTX if stream-related fields changed
+    const streamFields = ["ip", "port", "username", "password", "streamPath"];
+    const streamFieldChanged = streamFields.some(
+      (field) => req.body[field] !== undefined && req.body[field] !== currentCam[field]
+    );
+
+    if (streamFieldChanged) {
+      try {
+        console.log("🔄 Regenerating MediaMTX config after camera update...");
+        await stopMediaMTX();
+        await startMediaMTX(userId);
+        console.log("✅ MediaMTX restarted with updated camera config");
+      } catch (err) {
+        console.error("❌ Failed to restart MediaMTX:", err.message);
+      }
+    }
+
     res.json(cam);
   } catch (error) {
     if (error.message === "Camera not found") {

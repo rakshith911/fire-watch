@@ -1,8 +1,10 @@
 import React, { useState } from "react";
 import { useCameras } from "../store/cameras.jsx";
+import { FaEye, FaEyeSlash } from "react-icons/fa";
 
 export default function AddCameraDialog({ onClose }) {
   const { addCamera } = useCameras();
+  const [showPassword, setShowPassword] = useState(false);
   const [form, setForm] = useState({
     name: "",
     location: "",
@@ -109,11 +111,21 @@ export default function AddCameraDialog({ onClose }) {
           </div>
           <div>
             <label>Password</label>
-            <input
-              type="password"
-              value={form.password}
-              onChange={(e) => onChange("password", e.target.value)}
-            />
+            <div className="password-input-wrapper">
+              <input
+                type={showPassword ? "text" : "password"}
+                value={form.password}
+                onChange={(e) => onChange("password", e.target.value)}
+              />
+              <button
+                type="button"
+                className="password-toggle-btn"
+                onClick={() => setShowPassword(!showPassword)}
+                title={showPassword ? "Hide password" : "Show password"}
+              >
+                {showPassword ? <FaEyeSlash size={14} /> : <FaEye size={14} />}
+              </button>
+            </div>
           </div>
         </div>
 

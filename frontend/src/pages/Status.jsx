@@ -11,6 +11,8 @@ import {
   FaSave,
   FaSearch,
   FaTimes,
+  FaLock,
+  FaUnlock,
 } from "react-icons/fa";
 import { ImFire } from "react-icons/im";
 import { useAuth } from "../auth/AuthContext.jsx";
@@ -38,6 +40,7 @@ export default function Status({ onNavigate, currentPage = "status" }) {
   );
   const [editingCameraId, setEditingCameraId] = useState(null);
   const [editedValues, setEditedValues] = useState({});
+  const [showPassword, setShowPassword] = useState(false);
   const [deletedCameraIds, setDeletedCameraIds] = useState(new Set());
   const [animatingOutIds, setAnimatingOutIds] = useState(new Set());
   const [searchQuery, setSearchQuery] = useState("");
@@ -62,6 +65,7 @@ export default function Status({ onNavigate, currentPage = "status" }) {
         await updateCamera(camera.id, editedValues);
         setEditingCameraId(null);
         setEditedValues({});
+        setShowPassword(false);
 
         await fetchCamerasFromDB();
       } catch (error) {
@@ -76,7 +80,11 @@ export default function Status({ onNavigate, currentPage = "status" }) {
         location: camera.location,
         ip: camera.ip,
         port: camera.port,
+        username: camera.username || "",
+        password: camera.password || "",
+        streamPath: camera.streamPath || "/live",
       });
+      setShowPassword(false);
     }
   };
 
@@ -410,6 +418,9 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                     <div className="header-cell location-col">Location</div>
                     <div className="header-cell ip-col">IP Address</div>
                     <div className="header-cell port-col">Port</div>
+                    <div className="header-cell username-col">Username</div>
+                    <div className="header-cell password-col">Password</div>
+                    <div className="header-cell streampath-col">Stream Path</div>
                     <div className="header-cell view-col">View</div>
                     <div className="header-cell stream-col">Stream</div>
                     <div className="header-cell fire-col">Fire</div>
@@ -489,6 +500,70 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                             ) : (
                               <span className="cell-value">
                                 {c.port || "N/A"}
+                              </span>
+                            )}
+                          </div>
+                          <div className="table-cell username-col">
+                            <span className="cell-label">Username</span>
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                className="edit-input"
+                                value={editedValues.username}
+                                onChange={(e) =>
+                                  handleFieldChange("username", e.target.value)
+                                }
+                                placeholder="Optional"
+                              />
+                            ) : (
+                              <span className="cell-value">
+                                {c.username || "—"}
+                              </span>
+                            )}
+                          </div>
+                          <div className="table-cell password-col">
+                            <span className="cell-label">Password</span>
+                            {isEditing ? (
+                              <div className="password-input-wrapper">
+                                <input
+                                  type={showPassword ? "text" : "password"}
+                                  className="edit-input"
+                                  value={editedValues.password}
+                                  onChange={(e) =>
+                                    handleFieldChange("password", e.target.value)
+                                  }
+                                  placeholder="Optional"
+                                />
+                                <button
+                                  type="button"
+                                  className="password-toggle-btn"
+                                  onClick={() => setShowPassword(!showPassword)}
+                                  title={showPassword ? "Hide password" : "Show password"}
+                                >
+                                  {showPassword ? <FaEyeSlash size={14} /> : <FaEye size={14} />}
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="cell-value">
+                                {c.password ? "••••••" : "—"}
+                              </span>
+                            )}
+                          </div>
+                          <div className="table-cell streampath-col">
+                            <span className="cell-label">Stream Path</span>
+                            {isEditing ? (
+                              <input
+                                type="text"
+                                className="edit-input"
+                                value={editedValues.streamPath}
+                                onChange={(e) =>
+                                  handleFieldChange("streamPath", e.target.value)
+                                }
+                                placeholder="/live"
+                              />
+                            ) : (
+                              <span className="cell-value">
+                                {c.streamPath || "/live"}
                               </span>
                             )}
                           </div>

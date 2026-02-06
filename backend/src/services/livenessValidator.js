@@ -156,7 +156,7 @@ class LivenessValidator {
             // Compare pixels
             let movingPixels = 0;
             const totalPixels = crops[0].length;
-            const diffThreshold = 15; // Lowered from 20 to catch subtle smoke/fire
+            const diffThreshold = 8; // Lowered from 15 to catch subtle fire/smoke movement
 
             for (let i = 0; i < totalPixels; i++) {
                 const d1 = Math.abs(crops[0][i] - crops[1][i]);
@@ -171,8 +171,8 @@ class LivenessValidator {
             const ratio = movingPixels / totalPixels;
             console.log(`[Liveness] Fire Motion Ratio: ${ratio.toFixed(5)}`);
 
-            // Threshold: Lowered from 0.02 (2%) to 0.005 (0.5%) to catch small distant fires
-            return ratio > 0.005;
+            // Threshold: Lowered from 0.005 (0.5%) to 0.001 (0.1%) to reduce false "static" detections
+            return ratio > 0.001;
         } catch (err) {
             console.error("[Liveness] Error processing fire motion:", err);
             return false;

@@ -41,7 +41,7 @@ const cameraStates = new Map();
 // 🔧 Configuration - Multi-Frame Detection (Drone Method)
 // -------------------------------------------------------------------
 const FRAMES_PER_CHECK = 3; // Extract 3 frames per camera turn
-const BOX_IOU_THRESHOLD = 0.8; // 80% overlap = static (drone method)
+const BOX_IOU_THRESHOLD = 0.85; // 85% overlap = static (increased from 0.8 to reduce false "static" detections)
 const STATIC_THRESHOLD = 2; // currently not used to short-circuit, but we track it
 const MIN_CAMERA_INTERVAL = 1000; // Minimum 1 second between cameras
 const MIN_FRAME_INTERVAL = 500; // Minimum 500ms between frames
@@ -619,7 +619,7 @@ async function startQueueLoop() {
             const maxConfidence = Math.max(...framesWithBoxes.map(f => f.boxes[0][5]));
 
             const hasMovement = avgIoU < 0.95;
-            const highConfidence = maxConfidence > 0.7;
+            const highConfidence = maxConfidence > 0.5;  // Lowered from 0.7 - weapon model often scores 0.4-0.6
 
             // Depth check: real weapons (even thin knives) have depth from hand/handle/background
             // Posters/phone images are completely flat (stdDev ≈ 0)
