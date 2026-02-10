@@ -1,9 +1,23 @@
 import React from "react";
 
-export default function FireStatusButton({ isFire }) {
+const WEAPON_LABELS = ["Knife", "Pistol"];
+
+export default function FireStatusButton({ isFire, alertType }) {
+  const isWeapon = alertType && WEAPON_LABELS.includes(alertType);
+  const statusClass = isFire
+    ? isWeapon
+      ? "weapon"
+      : "fire"
+    : "clear";
+  const label = isFire
+    ? isWeapon
+      ? alertType.toUpperCase()
+      : "FIRE"
+    : "";
+
   return (
-    <div className={`fire-status-btn ${isFire ? "fire" : "clear"}`}>
-      {isFire ? "FIRE" : ""}
+    <div className={`fire-status-btn ${statusClass}`}>
+      {label}
     </div>
   );
 }

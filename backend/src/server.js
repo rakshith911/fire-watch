@@ -20,6 +20,7 @@ import {
   startDetectionQueue,
   stopDetectionQueue,
   setBroadcastFunction,
+  handleFrontendDetection,
 } from "./services/detectionQueue.js";
 import { dynamodb } from "./db/dynamodb.js";
 
@@ -143,6 +144,28 @@ wss.on("connection", async (ws, req) => {
     ws.send(
       JSON.stringify({ type: "connected", message: "WebSocket connected" })
     );
+
+    // Handle messages from frontend (e.g. frontend YOLO detection events)
+    ws.on("message", async (raw) => {
+      try {
+        const msg = JSON.parse(raw);
+        if (msg.type === "frontend-detection") {
+          log.info({
+            userId,
+            cameraId: msg.cameraId,
+            cameraName: msg.cameraName,
+            boxCount: msg.boxes?.length,
+            labels: (msg.boxes || []).map(b => b[4]),
+            source: "websocket-inbound",
+          }, "📩 WS message: frontend-detection received from browser");
+          await handleFrontendDetection(userId, msg);
+        } else {
+          log.info({ type: msg.type }, "📩 WS message: unknown type");
+        }
+      } catch (err) {
+        log.warn({ error: err.message }, "Failed to parse WebSocket message from client");
+      }
+    });
 
     ws.on("close", () => {
       const clients = wsClients.get(userId);

@@ -1,9 +1,9 @@
 import React, { useState } from "react";
 import { useCameras } from "../store/cameras.jsx";
 import StreamingIcon from "./StreamingIcon.jsx";
-import FireStatusButton from "./FireStatusButton.jsx";
 import { FaEye, FaEyeSlash, FaStopCircle, FaPlayCircle } from "react-icons/fa";
 import { ImFire } from "react-icons/im";
+import { GiBowieKnife, GiPistolGun } from "react-icons/gi";
 import { cameraApi } from "../services/cameraApi.js";
 
 export default function MiniStatusPanel({ viewMode = "grid" }) {
@@ -179,16 +179,14 @@ export default function MiniStatusPanel({ viewMode = "grid" }) {
             </button>
             <span className="camera-name">{cam.name}</span>
             <div className="status-icons">
-              {cam.isFire ? (
-                <ImFire
-                  size={26}
-                  style={{
-                    color: "#ff0000",
-                    filter: "drop-shadow(0 0 0 1px #ff6600)",
-                  }}
-                />
-              ) : (
-                <FireStatusButton isFire={false} />
+              {cam.isFire && cam.alertType === "Knife" && (
+                <GiBowieKnife size={26} style={{ color: "#ff6600" }} title="Knife detected" />
+              )}
+              {cam.isFire && cam.alertType === "Pistol" && (
+                <GiPistolGun size={26} style={{ color: "#ff6600" }} title="Pistol detected" />
+              )}
+              {cam.isFire && (!cam.alertType || cam.alertType === "Fire" || cam.alertType === "Smoke") && (
+                <ImFire size={26} style={{ color: "#ff0000" }} title="Fire detected" />
               )}
               <StreamingIcon isStreaming={cam.isStreaming} size={22} />
             </div>

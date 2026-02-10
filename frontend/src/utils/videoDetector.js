@@ -362,7 +362,10 @@ export class VideoDetector {
     } catch (e) {
       if (e.name === "SecurityError") {
         // frame came from a CORS-blocked source, skip gracefully
-        // optionally reset scratch to “untaint”
+        if (!this._corsWarned) {
+          console.warn(`[${this.id}] CORS SecurityError in getImageData — canvas tainted. Detection disabled for this stream.`);
+          this._corsWarned = true;
+        }
         this._scratch.width = S;
         this._scratch.height = S;
         return null;
@@ -494,6 +497,56 @@ export class VideoDetector {
     return keep;
   }
 
+  _processOutputWeapon(output, imgW, imgH) {
+    // YOLO column-major format: [1, (4+C), 8400] in 640px space
+    // Same structure as fire model but with weapon classes
+    let boxes = [];
+    const cells = 8400;
+    const clsCount = 2; // Knife, Pistol
+    const probThreshold = 0.55;
+    const labels = ["Knife", "Pistol"];
+
+    for (let i = 0; i < cells; i++) {
+      // pick max-prob class
+      let classId = 0, best = 0;
+      for (let c = 0; c < clsCount; c++) {
+        const p = output[cells * (c + 4) + i];
+        if (p > best) { best = p; classId = c; }
+      }
+      if (best < probThreshold) continue;
+
+      const xc = output[i];
+      const yc = output[cells + i];
+      const w  = output[2 * cells + i];
+      const h  = output[3 * cells + i];
+
+      const x1 = ((xc - w / 2) / 640) * imgW;
+      const y1 = ((yc - h / 2) / 640) * imgH;
+      const x2 = ((xc + w / 2) / 640) * imgW;
+      const y2 = ((yc + h / 2) / 640) * imgH;
+
+      boxes.push([x1, y1, x2, y2, labels[classId], best]);
+    }
+
+    // NMS
+    boxes.sort((a, b) => b[5] - a[5]);
+    const keep = [];
+    const iou = (A, B) => {
+      const ix1 = Math.max(A[0], B[0]), iy1 = Math.max(A[1], B[1]);
+      const ix2 = Math.min(A[2], B[2]), iy2 = Math.min(A[3], B[3]);
+      const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+      const areaA = (A[2] - A[0]) * (A[3] - A[1]);
+      const areaB = (B[2] - B[0]) * (B[3] - B[1]);
+      return inter / (areaA + areaB - inter || 1);
+    };
+    while (boxes.length) {
+      const head = boxes.shift();
+      keep.push(head);
+      boxes = boxes.filter((b) => iou(head, b) < 0.7);
+    }
+    return keep;
+  }
+
   _drawBoxes(boxes) {
     const ctx = this._ctx;
     ctx.save();
@@ -508,10 +561,19 @@ export class VideoDetector {
     ctx.lineWidth = lineWidth;
     ctx.font = `bold ${fontSize}px system-ui`;
 
+    const colorMap = {
+      Fire: "#00FF00",
+      Smoke: "#00FF00",
+      Other: "#00FF00",
+      Knife: "#FF0000",
+      Pistol: "#FF6600",
+    };
+
     boxes.forEach(([x1, y1, x2, y2, label]) => {
-      ctx.strokeStyle = "#00FF00";
+      const color = colorMap[label] || "#00FF00";
+      ctx.strokeStyle = color;
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-      ctx.fillStyle = "#00FF00";
+      ctx.fillStyle = color;
       const w = ctx.measureText(label).width;
       ctx.fillRect(
         x1,

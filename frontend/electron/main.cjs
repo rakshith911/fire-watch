@@ -93,6 +93,7 @@
 const { app, BrowserWindow, Menu, ipcMain, shell, dialog } = require("electron");
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
 const { spawn, exec } = require("child_process");
 const util = require("util");
 const { S3Client, GetObjectCommand, ListObjectsV2Command } = require("@aws-sdk/client-s3");
@@ -461,6 +462,99 @@ function createSplashWindow() {
   splashWindow.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(splashHtml));
 }
 
+// ✅ LOCAL HTTP SERVER for production builds
+// Web Workers can't fetch() from file:// protocol, so we serve dist/ over HTTP
+let frontendPort = 4100;
+let frontendServer = null;
+
+function startFrontendServer() {
+  return new Promise((resolve) => {
+    if (isDev) return resolve(); // Dev uses Vite's dev server
+
+    const distPath = path.join(__dirname, "../dist");
+    const MIME_TYPES = {
+      ".html": "text/html",
+      ".js": "application/javascript",
+      ".mjs": "application/javascript",
+      ".css": "text/css",
+      ".json": "application/json",
+      ".wasm": "application/wasm",
+      ".onnx": "application/octet-stream",
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".svg": "image/svg+xml",
+      ".ico": "image/x-icon",
+      ".woff": "font/woff",
+      ".woff2": "font/woff2",
+      ".ttf": "font/ttf",
+      ".map": "application/json",
+    };
+
+    frontendServer = http.createServer((req, res) => {
+      let urlPath = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
+      if (urlPath === "/") urlPath = "/index.html";
+
+      const filePath = path.join(distPath, urlPath);
+
+      // Security: prevent path traversal
+      if (!filePath.startsWith(distPath)) {
+        res.writeHead(403);
+        res.end("Forbidden");
+        return;
+      }
+
+      // SharedArrayBuffer requires cross-origin isolation headers.
+      // ort-wasm-simd-threaded.wasm needs SharedArrayBuffer even with numThreads=1.
+      const ISOLATION_HEADERS = {
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+      };
+
+      fs.readFile(filePath, (err, data) => {
+        if (err) {
+          // Try index.html for SPA routing
+          if (err.code === "ENOENT" && !path.extname(urlPath)) {
+            fs.readFile(path.join(distPath, "index.html"), (err2, html) => {
+              if (err2) {
+                res.writeHead(404);
+                res.end("Not found");
+                return;
+              }
+              res.writeHead(200, { "Content-Type": "text/html", ...ISOLATION_HEADERS });
+              res.end(html);
+            });
+            return;
+          }
+          res.writeHead(404);
+          res.end("Not found");
+          return;
+        }
+
+        const ext = path.extname(filePath).toLowerCase();
+        const contentType = MIME_TYPES[ext] || "application/octet-stream";
+        res.writeHead(200, { "Content-Type": contentType, ...ISOLATION_HEADERS });
+        res.end(data);
+      });
+    });
+
+    frontendServer.listen(frontendPort, "127.0.0.1", () => {
+      mlog(`✅ Frontend HTTP server running at http://127.0.0.1:${frontendPort}`);
+      resolve();
+    });
+
+    frontendServer.on("error", (err) => {
+      if (err.code === "EADDRINUSE") {
+        mlog(`⚠️ Port ${frontendPort} in use, trying ${frontendPort + 1}`);
+        frontendPort++;
+        frontendServer.listen(frontendPort, "127.0.0.1");
+      } else {
+        mlog("❌ Frontend server error:", err);
+      }
+    });
+  });
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -482,13 +576,10 @@ function createWindow() {
     mainWindow.loadURL("http://localhost:5173");
     mainWindow.webContents.openDevTools();
   } else {
-    // ✅ PRODUCTION: Load from built files
-    const indexPath = path.join(__dirname, "../dist/index.html");
-    mlog("🔍 PRODUCTION MODE: Loading file:", indexPath);
-    mainWindow.loadFile(indexPath);
-
-    // ✅ DEBUG: Open DevTools in production to help user debug
-    mainWindow.webContents.openDevTools();
+    // ✅ PRODUCTION: Load from local HTTP server so Web Workers can fetch() models/WASM
+    // file:// protocol doesn't support fetch() in Workers — HTTP server is the fix
+    mlog("🔍 PRODUCTION MODE: Loading from http://127.0.0.1:" + frontendPort);
+    mainWindow.loadURL(`http://127.0.0.1:${frontendPort}`);
   }
 
   mainWindow.once("ready-to-show", () => {
@@ -695,7 +786,8 @@ app.whenReady().then(async () => {
     return;
   }
 
-  // 4. Start App
+  // 4. Start frontend HTTP server (production only) + App
+  await startFrontendServer();
   createWindow();
   startBackend();
 
@@ -726,6 +818,9 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   if (backendProcess) {
     backendProcess.kill();
+  }
+  if (frontendServer) {
+    frontendServer.close();
   }
 });
 

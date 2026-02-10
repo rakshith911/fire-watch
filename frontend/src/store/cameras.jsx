@@ -173,6 +173,9 @@ export function CamerasProvider({ children }) {
     }
   });
 
+  // Global toggle for bounding boxes
+  const [showBoundingBoxes, setShowBoundingBoxes] = useState(false);
+
   // Fetch cameras from API in DB mode
   useEffect(() => {
     if (!USE_SEED_DATA) {
@@ -411,6 +414,7 @@ export function CamerasProvider({ children }) {
         isFire: cameraStatuses[cam.id]?.isFire || false,
         isStreaming: cameraStatuses[cam.id]?.isStreaming || false,
         isVisible: cameraVisibility[cam.id] !== false, // default to true if not set
+        alertType: cameraStatuses[cam.id]?.alertType || null,
       }));
       console.log(`[Camera Store] 📹 camerasWithStatus recomputed:`,
         result.map(c => ({ id: c.id, name: c.name, isFire: c.isFire, isStreaming: c.isStreaming }))
@@ -436,6 +440,8 @@ export function CamerasProvider({ children }) {
       error,
       fetchCamerasFromDB,
       mode: USE_SEED_DATA ? "seed" : "db",
+      showBoundingBoxes,
+      setShowBoundingBoxes,
     }),
     [
       camerasWithStatus,
@@ -449,6 +455,7 @@ export function CamerasProvider({ children }) {
       deleteCamera,
       loading,
       error,
+      showBoundingBoxes,
     ]
   );
 

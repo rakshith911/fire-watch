@@ -86,38 +86,106 @@ class LivenessValidator {
             const x2 = bbox[2];
             const y2 = bbox[3];
 
-            const bx = Math.floor(x1 * scaleX);
-            const by = Math.floor(y1 * scaleY);
-            const bw = Math.floor((x2 - x1) * scaleX);
-            const bh = Math.floor((y2 - y1) * scaleY);
+            const fullBx = Math.floor(x1 * scaleX);
+            const fullBy = Math.floor(y1 * scaleY);
+            const fullBw = Math.floor((x2 - x1) * scaleX);
+            const fullBh = Math.floor((y2 - y1) * scaleY);
 
-            // 3. Analyze Variance inside the box
-            const values = [];
+            // 3. Shrink bbox to center 40% to focus on the actual object
+            // The full bbox often includes lots of background which has natural
+            // 3D depth variation, causing flat images to pass as "3D"
+            const shrink = 0.3; // 30% margin on each side → center 40%
+            const bx = Math.floor(fullBx + fullBw * shrink);
+            const by = Math.floor(fullBy + fullBh * shrink);
+            const bw = Math.floor(fullBw * (1 - 2 * shrink));
+            const bh = Math.floor(fullBh * (1 - 2 * shrink));
+
+            // 4. Sample depth values INSIDE the shrunk box
+            const insideValues = [];
             for (let y = by; y < by + bh; y++) {
                 for (let x = bx; x < bx + bw; x++) {
                     if (y >= 0 && y < 518 && x >= 0 && x < 518) {
-                        values.push(output[y * 518 + x]);
+                        insideValues.push(output[y * 518 + x]);
                     }
                 }
             }
 
-            if (values.length === 0) return false;
+            if (insideValues.length === 0) return false;
 
-            // Calculate Standard Deviation
-            const mean = values.reduce((a, b) => a + b, 0) / values.length;
-            const variance = values.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / values.length;
-            const stdDev = Math.sqrt(variance);
+            // 5. Calculate stdDev inside the shrunk box
+            const insideMean = insideValues.reduce((a, b) => a + b, 0) / insideValues.length;
+            const insideVar = insideValues.reduce((a, b) => a + Math.pow(b - insideMean, 2), 0) / insideValues.length;
+            const insideStdDev = Math.sqrt(insideVar);
 
-            // Min/Max for debugging
-            const min = Math.min(...values);
-            const max = Math.max(...values);
+            // 6. Sample depth in a ring OUTSIDE the bbox for comparison
+            const expand = 0.15;
+            const ox1 = Math.max(0, Math.floor(fullBx - fullBw * expand));
+            const oy1 = Math.max(0, Math.floor(fullBy - fullBh * expand));
+            const ox2 = Math.min(518, Math.floor(fullBx + fullBw + fullBw * expand));
+            const oy2 = Math.min(518, Math.floor(fullBy + fullBh + fullBh * expand));
+            const outsideValues = [];
+            for (let y = oy1; y < oy2; y++) {
+                for (let x = ox1; x < ox2; x++) {
+                    // Only pixels OUTSIDE the original full bbox
+                    if (x >= fullBx && x < fullBx + fullBw && y >= fullBy && y < fullBy + fullBh) continue;
+                    if (y >= 0 && y < 518 && x >= 0 && x < 518) {
+                        outsideValues.push(output[y * 518 + x]);
+                    }
+                }
+            }
 
-            const is3D = stdDev > 0.001;
-            console.log(`[Liveness] 🔍 DEPTH ANALYSIS: stdDev=${stdDev.toFixed(6)}, min=${min.toFixed(4)}, max=${max.toFixed(4)}, range=${(max - min).toFixed(4)}, pixels=${values.length}, RESULT=${is3D ? '3D_REAL' : '2D_FLAT'}`);
+            const outsideMean = outsideValues.length > 0
+                ? outsideValues.reduce((a, b) => a + b, 0) / outsideValues.length
+                : insideMean;
 
-            // Threshold: Lowered significantly to catch thin objects like knives
-            // Previously was stdDev / 15.0 > 0.4 (effective stdDev > 6.0)
-            // Now checking raw stdDev. Knives might be around 0.05 - 0.2
+            // 7. Depth difference: real 3D object stands out from background
+            const depthDiff = Math.abs(insideMean - outsideMean);
+
+            // Min/Max for debugging (avoid spread to prevent stack overflow)
+            let min = Infinity, max = -Infinity;
+            for (let i = 0; i < insideValues.length; i++) {
+                if (insideValues[i] < min) min = insideValues[i];
+                if (insideValues[i] > max) max = insideValues[i];
+            }
+
+            // 8. ULTRA-CENTER flatness check (phone screen detection)
+            // Even if the overall bbox looks 3D (hand holding phone adds depth variation),
+            // the very center of a phone screen is dead flat. A real knife blade has
+            // subtle depth variation from angle, curvature, and reflections.
+            const ultraShrink = 0.4; // 40% margin each side → center 20% of bbox
+            const ucx = Math.floor(fullBx + fullBw * ultraShrink);
+            const ucy = Math.floor(fullBy + fullBh * ultraShrink);
+            const ucw = Math.floor(fullBw * (1 - 2 * ultraShrink));
+            const uch = Math.floor(fullBh * (1 - 2 * ultraShrink));
+            const ultraCenterValues = [];
+            for (let y = ucy; y < ucy + uch; y++) {
+                for (let x = ucx; x < ucx + ucw; x++) {
+                    if (y >= 0 && y < 518 && x >= 0 && x < 518) {
+                        ultraCenterValues.push(output[y * 518 + x]);
+                    }
+                }
+            }
+
+            let ultraCenterStdDev = 0;
+            if (ultraCenterValues.length > 0) {
+                const ucMean = ultraCenterValues.reduce((a, b) => a + b, 0) / ultraCenterValues.length;
+                const ucVar = ultraCenterValues.reduce((a, b) => a + Math.pow(b - ucMean, 2), 0) / ultraCenterValues.length;
+                ultraCenterStdDev = Math.sqrt(ucVar);
+            }
+
+            // Decision logic:
+            const DEPTH_THRESHOLD = 0.15;     // center region depth variance
+            const DIFF_THRESHOLD = 0.3;        // depth difference vs background
+            const FLAT_SCREEN_THRESHOLD = 0.05; // ultra-center flatness (phone screen)
+
+            const passes3D = insideStdDev > DEPTH_THRESHOLD || depthDiff > DIFF_THRESHOLD;
+            // Phone screen trap: bbox looks 3D overall (hand included) but the
+            // ultra-center is perfectly flat (screen surface)
+            const isFlatScreen = ultraCenterStdDev < FLAT_SCREEN_THRESHOLD && depthDiff > DIFF_THRESHOLD;
+            const is3D = passes3D && !isFlatScreen;
+
+            console.log(`[Liveness] 🔍 DEPTH ANALYSIS: insideStdDev=${insideStdDev.toFixed(4)}, depthDiff=${depthDiff.toFixed(4)}, ultraCenterStdDev=${ultraCenterStdDev.toFixed(4)}, insideMean=${insideMean.toFixed(4)}, outsideMean=${outsideMean.toFixed(4)}, threshold=${DEPTH_THRESHOLD}/${DIFF_THRESHOLD}/${FLAT_SCREEN_THRESHOLD}, min=${min.toFixed(4)}, max=${max.toFixed(4)}, pixels=${insideValues.length}(inside)/${outsideValues.length}(outside)/${ultraCenterValues.length}(ultraCenter), RESULT=${is3D ? '3D_REAL' : isFlatScreen ? '2D_PHONE_SCREEN' : '2D_FLAT'}`);
+
             return is3D;
         } catch (err) {
             console.error("[Liveness] Error processing weapon depth:", err);
@@ -125,21 +193,37 @@ class LivenessValidator {
         }
     }
 
-    async isFireMoving(framesBuffer, bbox) {
+    async isFireMoving(framesBuffer, bboxes) {
         // Expects array of 3 image buffers (JPEGs)
         if (framesBuffer.length < 3) return false; // Need more frames to decide
 
         try {
-            // bbox is [x1, y1, x2, y2]
-            const x1 = Math.max(0, Math.floor(bbox[0]));
-            const y1 = Math.max(0, Math.floor(bbox[1]));
-            const width = Math.floor(bbox[2] - bbox[0]);
-            const height = Math.floor(bbox[3] - bbox[1]);
+            // Check if bboxes is an array of boxes or a single box (legacy support/fallback)
+            // If it's a single box [x1, y1, x2, y2], wrap it
+            let boxes = bboxes;
+            if (bboxes.length > 0 && typeof bboxes[0] === 'number') {
+                boxes = framesBuffer.map(() => bboxes);
+            }
 
-            if (width <= 0 || height <= 0) return false;
+            // Crop the fire region from all 3 frames using PER-FRAME boxes
+            // This stabilizes the view: if the camera moves but the detector tracks the fire,
+            // the crop should contain the fire in the same relative position.
+            const crops = await Promise.all(framesBuffer.map(async (buf, i) => {
+                // Use the box for this frame, or fallback to the first one available
+                // If we have fewer boxes than frames (shouldn't happen), used the last known box
+                const bbox = boxes[Math.min(i, boxes.length - 1)];
 
-            // Crop the fire region from all 3 frames
-            const crops = await Promise.all(framesBuffer.map(async (buf) => {
+                const x1 = Math.max(0, Math.floor(bbox[0]));
+                const y1 = Math.max(0, Math.floor(bbox[1]));
+                const width = Math.floor(bbox[2] - bbox[0]);
+                const height = Math.floor(bbox[3] - bbox[1]);
+
+                if (width <= 0 || height <= 0) {
+                    // Return empty buffer or handle error? 
+                    // Sharp might throw on zero width. Let's return a blank 100x100.
+                    return Buffer.alloc(100 * 100, 0);
+                }
+
                 return sharp(buf)
                     .extract({
                         left: x1,
@@ -153,29 +237,37 @@ class LivenessValidator {
                     .toBuffer();
             }));
 
-            // Compare pixels
+            // Compare pixels between consecutive frames
             let movingPixels = 0;
+            let totalDiffMagnitude = 0;
             const totalPixels = crops[0].length;
-            const diffThreshold = 8; // Lowered from 15 to catch subtle fire/smoke movement
+            // Threshold 20: Increased from 15 to 20 to reduce false positives from compression artifacts
+            // Real fire movement produces differences of 40-100+
+            const diffThreshold = 20;
 
             for (let i = 0; i < totalPixels; i++) {
                 const d1 = Math.abs(crops[0][i] - crops[1][i]);
                 const d2 = Math.abs(crops[1][i] - crops[2][i]);
 
-                // If it changed in both steps, it's flickering
+                // If it changed significantly in both consecutive pairs, it's flickering
                 if (d1 > diffThreshold && d2 > diffThreshold) {
                     movingPixels++;
+                    totalDiffMagnitude += (d1 + d2) / 2;
                 }
             }
 
             const ratio = movingPixels / totalPixels;
-            console.log(`[Liveness] Fire Motion Ratio: ${ratio.toFixed(5)}`);
+            const avgDiff = movingPixels > 0 ? totalDiffMagnitude / movingPixels : 0;
+            console.log(`[Liveness] Fire Motion: ratio=${ratio.toFixed(5)} (${movingPixels}/${totalPixels} pixels), avgDiff=${avgDiff.toFixed(1)}`);
 
-            // Threshold: Lowered from 0.005 (0.5%) to 0.001 (0.1%) to reduce false "static" detections
-            return ratio > 0.001;
+            // Return ratio instead of boolean — caller uses context-dependent thresholds:
+            // - Moving boxes (IoU < 0.85): ratio > 0.10 (10%) = real fire
+            // - Static boxes (IoU > 0.85): ratio > 0.25 (25%) = real fire in fixed location
+            //   Phone screens produce ~0.05-0.14, real fire produces 0.25-0.50+
+            return ratio;
         } catch (err) {
             console.error("[Liveness] Error processing fire motion:", err);
-            return false;
+            return 0; // Return 0 ratio on error
         }
     }
 }

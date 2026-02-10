@@ -169,7 +169,7 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
 
     const numQueries = 300;
     const stride = 6;  // RT-DETR format: [x1, y1, x2, y2, conf, class_id]
-    const probThreshold = 0.35;  // Lowered from 0.5 - model often scores real knives 0.3-0.5
+    const probThreshold = 0.35;  // LOW threshold to pass candidates to detectionQueue. Logic there handles strict/consistency checks.
 
     // Verify data length
     const expectedLength = numQueries * stride;
@@ -288,7 +288,12 @@ export async function detectWeapon(cameraUrl, cameraName) {
             camera: cameraName,
             detected: result.detected,
             boxCount: result.boxes.length,
-        }, "🔫 WEAPON: Detection complete");
+            boxes: result.boxes.map(b => ({
+                label: b[4],
+                confidence: b[5]?.toFixed(3),
+                coords: `[${b[0]?.toFixed(0)},${b[1]?.toFixed(0)},${b[2]?.toFixed(0)},${b[3]?.toFixed(0)}]`,
+            })),
+        }, `🔫 WEAPON: Detection complete — ${result.detected ? 'DETECTED' : 'CLEAR'}`);
 
         return {
             isWeapon: result.detected,

@@ -1,7 +1,7 @@
 {
   "name": "firewatch-frontend",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.3.6",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -14,7 +14,7 @@
     "dist": "node scripts/build-electron.js",
     "download-models": "node ../backend/scripts/download-models.js",
     "generate-build-id": "node scripts/generate-build-id.cjs",
-    "build-dist": "npm run generate-build-id && npm run build && npm run install-backend-deps && electron-builder --publish=never",
+    "build-dist": "npm version patch --no-git-tag-version && npm run generate-build-id && npm run build && npm run install-backend-deps && electron-builder --publish=never",
     "install-backend-deps": "cd ../backend && npm install --production --no-bin-links"
   },
   "dependencies": {
@@ -75,6 +75,10 @@
         "from": "../backend/node_modules",
         "to": "backend/node_modules"
       }
+    ],
+    "asarUnpack": [
+      "dist/assets/ort/*.wasm",
+      "dist/*.onnx"
     ],
     "mac": {
       "category": "public.app-category.utilities",

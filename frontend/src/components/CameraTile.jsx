@@ -519,6 +519,7 @@ import { useCameras } from "../store/cameras.jsx";
 import StreamingIcon from "./StreamingIcon.jsx";
 import FireStatusButton from "./FireStatusButton.jsx";
 import { getMediaMTXUrl } from "../config/electron.js";
+import { sendDetectionEvent } from "../utils/webSocketClient.js";
 
 // We'll lazy-load your ESM VideoDetector class from utils directory
 let VideoDetectorClassPromise;
@@ -534,14 +535,15 @@ function loadVideoDetector() {
 export default function CameraTile({ cam }) {
   const videoRef = useRef(null);
   const [status, setStatus] = useState("Idle");
-  const [isFire, setIsFire] = useState(false); // can set this to true if you want to show the fire status button
+  const [isFire, setIsFire] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [viewed, setViewed] = useState(true); // you can wire this to visibility/selection
+  const [viewed, setViewed] = useState(true);
   const [showSpinner, setShowSpinner] = useState(false);
-  const { updateCameraStatus } = useCameras();
+  const [alertType, setAlertType] = useState(null); // "Fire", "Knife", "Pistol", etc.
+  const { updateCameraStatus, showBoundingBoxes } = useCameras();
 
   // Flag to control local detection - set to false to disable local detection. Change to true to enable local detection.
-  const isStartLocalDetection = false;
+  const isStartLocalDetection = true;
 
   // keep detector instance for local mode
   const detectorRef = useRef(null);
@@ -553,33 +555,32 @@ export default function CameraTile({ cam }) {
   const resizeObserverRef = useRef(null);
   // Timeout for spinner delay
   const spinnerTimeoutRef = useRef(null);
+  // Debounce: last time a detection event was sent to backend
+  const lastDetectionSentRef = useRef(0);
 
-  // Sync backend fire status to local state immediately
-  const [backendFireDetected, setBackendFireDetected] = useState(
-    cam.isFire || false
-  );
+  // Ref to track bounding box visibility for the animation loop
+  const showBoxesRef = useRef(showBoundingBoxes);
 
-  // Update local state immediately when cam.isFire changes
   useEffect(() => {
-    console.log(`[${cam.name}] 🔥 cam.isFire changed to:`, cam.isFire);
-    setBackendFireDetected(cam.isFire || false);
-  }, [cam.isFire, cam.name]);
+    showBoxesRef.current = showBoundingBoxes;
+  }, [showBoundingBoxes]);
+
+
+  // Resolve detection method once (default to LOCAL if missing from DB)
+  const detMethod = (cam.detection || "LOCAL").toUpperCase();
+  const isLocalDetection = detMethod === "LOCAL" || detMethod === "BOTH";
 
   // Update camera status in store whenever local state changes
-  // NOTE: Only update isFire status if local detection is enabled, to avoid overwriting backend fire detection
   useEffect(() => {
     const updates = { isStreaming };
 
-    // Only update isFire if local detection is actually running
-    if (
-      isStartLocalDetection &&
-      (cam.detection === "LOCAL" || cam.detection === "BOTH")
-    ) {
+    if (isStartLocalDetection && isLocalDetection) {
       updates.isFire = isFire;
+      updates.alertType = alertType;
     }
 
     updateCameraStatus(cam.id, updates);
-  }, [isFire, isStreaming, cam.id, cam.detection, updateCameraStatus]);
+  }, [isFire, isStreaming, alertType, cam.id, isLocalDetection, updateCameraStatus]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -756,20 +757,20 @@ export default function CameraTile({ cam }) {
             hls = new Hls({ liveDurationInfinity: true });
             hls.loadSource(cam.hlsUrl);
             hls.attachMedia(v);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
+            hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => { }));
           } else if (v.canPlayType("application/vnd.apple.mpegurl")) {
             v.src = cam.hlsUrl;
-            await v.play().catch(() => {});
+            await v.play().catch(() => { });
           } else {
             v.src = cam.hlsUrl || "";
-            await v.play().catch(() => {});
+            await v.play().catch(() => { });
           }
         } else if (cam.streamType === "MP4") {
           console.log(`[${cam.name}] 🔗 Connecting to MP4:`, {
             url: cam.hlsUrl,
           });
           v.src = cam.hlsUrl;
-          await v.play().catch(() => {});
+          await v.play().catch(() => { });
         }
         if (!cancelled) {
           setIsStreaming(true);
@@ -785,10 +786,7 @@ export default function CameraTile({ cam }) {
     // detection wiring
     async function startDetection() {
       if (cancelled) return;
-      if (
-        isStartLocalDetection &&
-        (cam.detection === "LOCAL" || cam.detection === "BOTH")
-      ) {
+      if (isStartLocalDetection && isLocalDetection) {
         console.log(`[${cam.name}] Starting local detection...`);
         const VideoDetector = await loadVideoDetector();
         if (cancelled) return;
@@ -803,6 +801,42 @@ export default function CameraTile({ cam }) {
             if (cancelled) return;
             const any = boxes && boxes.length > 0;
             setIsFire(any);
+
+            // Determine alert type from box labels
+            if (any) {
+              const weaponLabels = ["Knife", "Pistol"];
+              const hasWeapon = boxes.some(b => weaponLabels.includes(b[4]));
+              const hasFire = boxes.some(b => b[4] === "Fire" || b[4] === "Smoke");
+              if (hasWeapon) {
+                // Use the specific weapon label (Knife or Pistol)
+                const topWeapon = boxes.find(b => weaponLabels.includes(b[4]));
+                setAlertType(topWeapon[4]);
+              } else if (hasFire) {
+                setAlertType("Fire");
+              }
+            } else {
+              setAlertType(null);
+            }
+
+            // Send high-confidence detections to backend (debounced 5s)
+            if (any) {
+              const highConfBoxes = boxes.filter((b) => b[5] >= 0.5);
+              const now = Date.now();
+              if (highConfBoxes.length > 0 && now - lastDetectionSentRef.current > 5000) {
+                lastDetectionSentRef.current = now;
+                console.log(`[${cam.name}] Sending frontend detection to backend:`, {
+                  boxCount: highConfBoxes.length,
+                  labels: highConfBoxes.map(b => `${b[4]}(${b[5]?.toFixed(2)})`),
+                });
+                sendDetectionEvent({
+                  type: "frontend-detection",
+                  cameraId: cam.id,
+                  cameraName: cam.name,
+                  boxes: highConfBoxes,
+                  timestamp: new Date().toISOString(),
+                });
+              }
+            }
           },
         });
 
@@ -822,32 +856,47 @@ export default function CameraTile({ cam }) {
           d._overlay = canvas;
           d._ctx = canvas.getContext("2d");
 
-          // Sync canvas size with video element's rendered size
+          // Sync canvas to the actual video CONTENT area (not the element rect)
+          // because object-fit: contain leaves letterbox bars
           const syncCanvasSize = () => {
             if (v.videoWidth && v.videoHeight) {
-              // Set canvas internal resolution to video's natural size
               canvas.width = v.videoWidth;
               canvas.height = v.videoHeight;
 
-              // Set canvas display size to match video element's rendered size
-              const rect = v.getBoundingClientRect();
-              canvas.style.width = `${rect.width}px`;
-              canvas.style.height = `${rect.height}px`;
+              // Calculate the actual content rect inside the element
+              const elemRect = v.getBoundingClientRect();
+              const videoRatio = v.videoWidth / v.videoHeight;
+              const elemRatio = elemRect.width / elemRect.height;
 
-              // Position canvas to overlay video exactly
-              const videoRect = v.getBoundingClientRect();
+              let contentW, contentH, offsetX, offsetY;
+              if (videoRatio > elemRatio) {
+                // Video wider than element — letterbox top/bottom
+                contentW = elemRect.width;
+                contentH = elemRect.width / videoRatio;
+                offsetX = 0;
+                offsetY = (elemRect.height - contentH) / 2;
+              } else {
+                // Video taller than element — letterbox left/right
+                contentH = elemRect.height;
+                contentW = elemRect.height * videoRatio;
+                offsetX = (elemRect.width - contentW) / 2;
+                offsetY = 0;
+              }
+
+              canvas.style.width = `${contentW}px`;
+              canvas.style.height = `${contentH}px`;
+
               const parentRect = v.parentElement.getBoundingClientRect();
-              canvas.style.left = `${videoRect.left - parentRect.left}px`;
-              canvas.style.top = `${videoRect.top - parentRect.top}px`;
-
-              console.log(
-                `[${cam.name}] Canvas synced: ${canvas.width}x${canvas.height} display: ${rect.width}x${rect.height}`
-              );
+              canvas.style.left = `${elemRect.left - parentRect.left + offsetX}px`;
+              canvas.style.top = `${elemRect.top - parentRect.top + offsetY}px`;
             }
           };
           v.addEventListener("loadedmetadata", syncCanvasSize);
           v.addEventListener("resize", syncCanvasSize);
           v.addEventListener("play", syncCanvasSize);
+
+          // Call immediately in case video is already playing (events already fired)
+          syncCanvasSize();
 
           // Use ResizeObserver to sync canvas when video element resizes (e.g., view changes)
           resizeObserverRef.current = new ResizeObserver(() => {
@@ -858,81 +907,210 @@ export default function CameraTile({ cam }) {
 
         detectorRef.current = d;
 
-        // Start the detector (spawn worker and bind video loop)
+        // Determine which model(s) to run based on camera aiType
+        const camAiType = (cam.aiType || "FIRE").toUpperCase();
+        const needsFire = camAiType === "FIRE" || camAiType === "BOTH";
+        const needsWeapon = camAiType === "WEAPON" || camAiType === "BOTH";
+
+        console.log(`[${cam.name}] aiType=${camAiType} needsFire=${needsFire} needsWeapon=${needsWeapon}`);
+
+        // Start the detector (spawn worker(s) and bind video loop)
         // DON'T call attachWebRTC or start() since we're manually managing video/canvas
-        // vite ignore is important to prevent build errors due to dynamic name
-        if (!d._worker) {
-          // Spawn worker
-          d._worker = new Worker(
+        if (needsFire && needsWeapon) {
+          // === BOTH mode: two workers running simultaneously ===
+          let fireBusy = false, weaponBusy = false;
+          let fireBoxes = [], weaponBoxes = [];
+          let boxesDirty = false; // flag to call onDetections only when results arrive
+
+          const fireWorker = new Worker(
             new URL("../utils/worker-client.js", import.meta.url),
-            /* @vite-ignore */ { type: "module", name: cam.name }
+            /* @vite-ignore */ { type: "module", name: `${cam.name}-fire` }
+          );
+          const weaponWorker = new Worker(
+            new URL("../utils/worker-weapon.js", import.meta.url),
+            /* @vite-ignore */ { type: "module", name: `${cam.name}-weapon` }
           );
 
-          d._worker.onmessage = (evt) => {
-            const output = evt.data;
-            d._boxes = d._processOutput(
-              output,
-              d._overlay.width,
-              d._overlay.height
-            );
-            d.onDetections(d._boxes);
-            d._busy = false;
+          fireWorker.onmessage = (evt) => {
+            fireBoxes = d._processOutput(evt.data, d._overlay.width, d._overlay.height);
+            fireBusy = false;
+            boxesDirty = true;
+          };
+          fireWorker.onerror = (e) => {
+            console.error(`[${cam.name}] Fire worker error:`, e);
           };
 
-          d._worker.onerror = (e) => {
-            console.error(`[${cam.name}] Worker error:`, e);
-            d._worker = null;
+          weaponWorker.onmessage = (evt) => {
+            weaponBoxes = d._processOutputWeapon(evt.data, d._overlay.width, d._overlay.height);
+            weaponBusy = false;
+            boxesDirty = true;
+          };
+          weaponWorker.onerror = (e) => {
+            console.error(`[${cam.name}] Weapon worker error:`, e);
           };
 
-          console.log(`[${cam.name}] Worker created`);
-        }
+          d._worker = fireWorker;
+          d._weaponWorker = weaponWorker;
 
-        // Bind video loop
-        if (!d._rafHandle) {
-          const tick = (t) => {
-            d._rafHandle = requestAnimationFrame(tick);
-            if (t - d._lastTick < d.throttleMs) return;
-            d._lastTick = t;
+          console.log(`[${cam.name}] Both fire + weapon workers created`);
 
-            if (!d._video || !d._overlay) return;
-            if (d._video.videoWidth === 0 || d._video.videoHeight === 0) return;
-
-            // Clear canvas and draw only boxes (NOT the video)
-            d._ctx.clearRect(0, 0, d._overlay.width, d._overlay.height);
-            d._drawBoxes(d._boxes);
-
-            if (d._busy) return;
-
-            // Prepare input from video element (not canvas)
-            const buffer = d._prepareInput(d._video);
-            if (!buffer) return;
-
-            if (d._worker) {
-              d._worker.postMessage(
-                {
-                  type: "infer",
-                  data: buffer,
-                  dims: [1, 3, d.modelInputSize, d.modelInputSize],
-                },
-                [buffer]
-              );
-            }
-            d._busy = true;
-          };
-
-          // Start loop when video plays
-          const startLoop = () => {
-            if (!d._rafHandle) {
+          // Bind video loop for BOTH mode
+          if (!d._rafHandle) {
+            const tick = (t) => {
               d._rafHandle = requestAnimationFrame(tick);
-              console.log(`[${cam.name}] Detection loop started`);
+              if (t - d._lastTick < d.throttleMs) return;
+              d._lastTick = t;
+
+              if (!d._video || !d._overlay) return;
+              if (d._video.videoWidth === 0 || d._video.videoHeight === 0) return;
+
+              // Merge boxes from both models and draw
+              d._boxes = [...fireBoxes, ...weaponBoxes];
+              d._ctx.clearRect(0, 0, d._overlay.width, d._overlay.height);
+              if (showBoxesRef.current) {
+                d._drawBoxes(d._boxes);
+              }
+
+              // Only call onDetections when a worker returned new results
+              if (boxesDirty) {
+                d.onDetections(d._boxes);
+                boxesDirty = false;
+              }
+
+              // Send frames to whichever worker isn't busy
+              const buffer = d._prepareInput(d._video);
+              if (!buffer) return;
+
+              // Both workers need the same input — copy for the second
+              if (!fireBusy || !weaponBusy) {
+                const shared = new Float32Array(buffer);
+                if (!fireBusy) {
+                  const copy = shared.buffer.slice(0);
+                  fireWorker.postMessage(
+                    { type: "infer", data: copy, dims: [1, 3, d.modelInputSize, d.modelInputSize] },
+                    [copy]
+                  );
+                  fireBusy = true;
+                }
+                if (!weaponBusy) {
+                  const copy = shared.buffer.slice(0);
+                  weaponWorker.postMessage(
+                    { type: "infer", data: copy, dims: [1, 3, d.modelInputSize, d.modelInputSize] },
+                    [copy]
+                  );
+                  weaponBusy = true;
+                }
+              }
+            };
+
+            const startLoop = () => {
+              if (!d._rafHandle) {
+                d._rafHandle = requestAnimationFrame(tick);
+                console.log(`[${cam.name}] BOTH detection loop started`);
+              }
+            };
+            v.addEventListener("play", startLoop, { once: true });
+            if (!v.paused && v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+              startLoop();
             }
-          };
+          }
+        } else {
+          // === Single model mode (FIRE or WEAPON) ===
+          if (!d._worker) {
+            const workerUrl = needsWeapon
+              ? new URL("../utils/worker-weapon.js", import.meta.url)
+              : new URL("../utils/worker-client.js", import.meta.url);
 
-          v.addEventListener("play", startLoop, { once: true });
+            d._worker = new Worker(
+              workerUrl,
+              /* @vite-ignore */ { type: "module", name: cam.name }
+            );
 
-          // Also start now if already playing
-          if (!v.paused && v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-            startLoop();
+            let firstResponse = true;
+            d._worker.onmessage = (evt) => {
+              const output = evt.data;
+              if (firstResponse) {
+                firstResponse = false;
+                console.log(`[${cam.name}] First inference response received — model loaded OK, output length: ${output.length}, canvas: ${d._overlay.width}x${d._overlay.height}`);
+              }
+              d._boxes = needsWeapon
+                ? d._processOutputWeapon(output, d._overlay.width, d._overlay.height)
+                : d._processOutput(output, d._overlay.width, d._overlay.height);
+              d.onDetections(d._boxes);
+              d._busy = false;
+            };
+
+            d._worker.onerror = (e) => {
+              console.error(`[${cam.name}] Worker error:`, e);
+              d._worker = null;
+              d._busy = false; // Reset so loop doesn't get stuck
+            };
+
+            console.log(`[${cam.name}] ${needsWeapon ? "Weapon" : "Fire"} worker created`);
+          }
+
+          // Bind video loop for single model
+          if (!d._rafHandle) {
+            let loggedFirstTick = false;
+            const tick = (t) => {
+              d._rafHandle = requestAnimationFrame(tick);
+              if (t - d._lastTick < d.throttleMs) return;
+              d._lastTick = t;
+
+              if (!d._video || !d._overlay) return;
+              if (d._video.videoWidth === 0 || d._video.videoHeight === 0) return;
+
+              if (!loggedFirstTick) {
+                loggedFirstTick = true;
+                console.log(`[${cam.name}] Detection tick running — video: ${d._video.videoWidth}x${d._video.videoHeight}, canvas: ${d._overlay.width}x${d._overlay.height}, worker: ${!!d._worker}`);
+              }
+
+              // Clear canvas and draw only boxes (NOT the video)
+              d._ctx.clearRect(0, 0, d._overlay.width, d._overlay.height);
+
+              if (showBoxesRef.current) {
+                d._drawBoxes(d._boxes);
+              }
+
+              if (d._busy) return;
+
+              // Prepare input from video element (not canvas)
+              const buffer = d._prepareInput(d._video);
+              if (!buffer) {
+                if (!d._prepareInputWarnLogged) {
+                  console.warn(`[${cam.name}] _prepareInput returned null (likely CORS). Detection frames cannot be sent.`);
+                  d._prepareInputWarnLogged = true;
+                }
+                return;
+              }
+
+              if (d._worker) {
+                d._worker.postMessage(
+                  {
+                    type: "infer",
+                    data: buffer,
+                    dims: [1, 3, d.modelInputSize, d.modelInputSize],
+                  },
+                  [buffer]
+                );
+                d._busy = true;
+              }
+            };
+
+            // Start loop when video plays
+            const startLoop = () => {
+              if (!d._rafHandle) {
+                d._rafHandle = requestAnimationFrame(tick);
+                console.log(`[${cam.name}] Detection loop started`);
+              }
+            };
+
+            v.addEventListener("play", startLoop, { once: true });
+
+            // Also start now if already playing
+            if (!v.paused && v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+              startLoop();
+            }
           }
         }
       }
@@ -955,7 +1133,6 @@ export default function CameraTile({ cam }) {
       // }
     }
 
-    // Only connect and start detection (don't check backendFireDetected here to avoid reconnections)
     attachStream().then(startDetection);
 
     return () => {
@@ -988,6 +1165,11 @@ export default function CameraTile({ cam }) {
 
       if (detectorRef.current) {
         try {
+          // Terminate weapon worker if it exists (BOTH mode)
+          if (detectorRef.current._weaponWorker) {
+            detectorRef.current._weaponWorker.terminate();
+            detectorRef.current._weaponWorker = null;
+          }
           // Remove overlay canvas if it exists
           if (
             detectorRef.current._overlay &&
@@ -1027,11 +1209,11 @@ export default function CameraTile({ cam }) {
     cam.webrtcBase,
     cam.streamName,
     cam.detection,
-    // NOTE: backendFireDetected NOT included to prevent reconnection on fire status change
   ]);
 
-  // ✅ Combine backend fire detection with local/cloud detection for display
-  const displayFireStatus = backendFireDetected || isFire;
+  const displayFireStatus = cam.isFire || isFire;
+  // Determine which alert type to display — local detection takes priority, then backend
+  const displayAlertType = alertType || cam.alertType || (displayFireStatus ? "Fire" : null);
 
   return (
     <div className="tile">
@@ -1044,7 +1226,8 @@ export default function CameraTile({ cam }) {
         <div className="tile-status-icons">
           <FireStatusButton
             isFire={displayFireStatus}
-            key={`fire-${displayFireStatus}`}
+            alertType={displayAlertType}
+            key={`fire-${displayFireStatus}-${displayAlertType}`}
           />
         </div>
       </div>

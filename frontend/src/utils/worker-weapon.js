@@ -1,11 +1,11 @@
-// frontend/src/utils/worker-client.js
+// frontend/src/utils/worker-weapon.js
+// Web Worker for RT-DETR weapon detection model (Knife/Pistol)
 import * as ort from "onnxruntime-web";
 
 // Models live in publicDir (models/), served at root.
-// In dev: /yolov11n_bestFire.onnx  In build: ./yolov11n_bestFire.onnx
 const modelUrl = import.meta.env.DEV
-  ? "/yolov11n_bestFire.onnx"
-  : new URL("../yolov11n_bestFire.onnx", import.meta.url).href;
+  ? "/weapons_yolo.onnx"
+  : new URL("../weapons_yolo.onnx", import.meta.url).href;
 
 // WASM files: .wasm served from publicDir at /assets/ort/
 // .mjs loaders redirected to node_modules by vite plugin (see vite.config.js)
@@ -14,36 +14,24 @@ const wasmDir = import.meta.env.DEV
   ? "/assets/ort/"
   : new URL("./ort/", import.meta.url).href;
 ort.env.wasm.wasmPaths = wasmDir;
-
 ort.env.wasm.simd = true;
 ort.env.wasm.numThreads = 1;
 
-const sessionOptions = { executionProviders: ["wasm"] };
-
-// In packaged Electron (file://) you usually won't have cross-origin isolation,
-// so SharedArrayBuffer may be unavailable. Keep it adaptive.
-// ort.env.wasm.simd = true; // harmless if unsupported
-// if (typeof SharedArrayBuffer !== "undefined") {
-//   ort.env.wasm.numThreads = 4;
-//   console.log("[worker] Multithread enabled");
-// } else {
-//   console.warn(
-//     "[worker] SharedArrayBuffer not available; running single-thread"
-//   );
-// }
-
-console.log("[fire-worker] Loading model from:", modelUrl, "WASM from:", wasmDir);
+console.log("[weapon-worker] Loading model from:", modelUrl, "WASM from:", wasmDir);
 
 let sessionPromise;
 function getSession() {
   if (!sessionPromise) {
-    sessionPromise = ort.InferenceSession.create(modelUrl, sessionOptions).then(
-      (s) => {
-        console.log("[fire-worker] ONNX session ready");
-        return s;
-      }
-    ).catch((err) => {
-      console.error("[fire-worker] ONNX session FAILED to load:", err);
+    sessionPromise = ort.InferenceSession.create(modelUrl, {
+      executionProviders: ["wasm"],
+    }).then((s) => {
+      console.log("[weapon-worker] ONNX session ready", {
+        inputNames: s.inputNames,
+        outputNames: s.outputNames,
+      });
+      return s;
+    }).catch((err) => {
+      console.error("[weapon-worker] ONNX session FAILED to load:", err);
       sessionPromise = null; // Allow retry
       throw err;
     });
@@ -64,11 +52,11 @@ self.onmessage = async (event) => {
     const t0 = performance.now();
     const outputs = await session.run({ images: tensor });
     const t1 = performance.now();
-    if (Math.random() < 0.05) console.log(`[fire-worker] inference: ${(t1-t0).toFixed(0)}ms`);
+    if (Math.random() < 0.05) console.log(`[weapon-worker] inference: ${(t1-t0).toFixed(0)}ms`);
     const first = outputs[Object.keys(outputs)[0]];
     self.postMessage(first.data);
   } catch (err) {
-    console.error("[worker] inference error:", err);
+    console.error("[weapon-worker] inference error:", err);
     // Post empty result so main thread resets _busy flag and can retry
     self.postMessage(new Float32Array(0));
   }

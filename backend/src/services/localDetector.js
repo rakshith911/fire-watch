@@ -42,7 +42,7 @@ function getSession() {
 // -------------------------------------------------------------------
 // 🖼️ Frame Extraction via ffmpeg
 // -------------------------------------------------------------------
-function grabFrameOnce(srcUrl) {
+export function grabFrameOnce(srcUrl) {
   return new Promise((resolve, reject) => {
     const isRtsp = srcUrl.startsWith("rtsp://");
     const args = ["-y"];
@@ -87,7 +87,7 @@ function grabFrameOnce(srcUrl) {
  * always start at the same I-frame, producing identical images.
  * Uses fps filter to space frames ~1s apart within a short capture window.
  */
-function grabMultipleFrames(srcUrl, numFrames = 3) {
+export function grabMultipleFrames(srcUrl, numFrames = 3) {
   return new Promise((resolve, reject) => {
     const isRtsp = srcUrl.startsWith("rtsp://");
     const args = ["-y"];

@@ -1,75 +1,8 @@
-import { cfg } from "../config.js";
-import { spawn } from "node:child_process";
 import fetch from "node-fetch";
 import pino from "pino";
+import { grabMultipleFrames } from "./localDetector.js";
 
 const log = pino({ name: "cloud-detector" });
-
-// ===================================================================
-// 🖼️ Frame Extraction via ffmpeg (Same as localDetector.js)
-// ===================================================================
-function grabFrameOnce(srcUrl) {
-  return new Promise((resolve, reject) => {
-    const isRtsp = srcUrl.startsWith("rtsp://");
-    const args = ["-y"];
-    
-    if (isRtsp) {
-      args.push(
-        "-rtsp_transport", "tcp",
-        "-timeout", "5000000",
-        "-analyzeduration", "1000000",
-        "-probesize", "1000000"
-      );
-    }
-
-    args.push("-i", srcUrl, "-frames:v", "1", "-q:v", "2", "-f", "image2", "-");
-
-    const ff = spawn(cfg.ffmpeg, args, { stdio: ["ignore", "pipe", "pipe"] });
-    const chunks = [];
-    let err = "";
-
-    ff.stdout.on("data", (d) => chunks.push(d));
-    ff.stderr.on("data", (d) => (err += d.toString()));
-    ff.on("error", reject);
-    ff.on("close", (code) => {
-      if (code === 0 && chunks.length) resolve(Buffer.concat(chunks));
-      else reject(new Error(`ffmpeg exit ${code}: ${err.split("\n").slice(-3).join(" ")}`));
-    });
-  });
-}
-
-// ===================================================================
-// 🎥 Build Camera Input URL (Same as localDetector.js)
-// ===================================================================
-export function buildCameraUrl(cam) {
-  // ✅ PRIORITY 1: RTSP camera with IP address
-  if (cam.ip && cam.ip.trim() !== '') {
-    const protocol = "rtsp://";
-    const auth = cam.username && cam.password
-      ? `${encodeURIComponent(cam.username)}:${encodeURIComponent(cam.password)}@`
-      : "";
-    const addr = cam.port ? `${cam.ip}:${cam.port}` : cam.ip;
-    const path = cam.streamPath || "/live";
-    const url = `${protocol}${auth}${addr}${path}`;
-    
-    log.debug({ cameraId: cam.id, url: url.replace(/:([^:@]+)@/, ":****@") }, "Built RTSP URL for cloud detection");
-    return url;
-  }
-
-  // ✅ PRIORITY 2: HLS stream URL
-  if (cam.hlsUrl && cam.hlsUrl.trim() !== '') {
-    log.debug({ cameraId: cam.id, url: cam.hlsUrl }, "Using HLS URL for cloud detection");
-    return cam.hlsUrl;
-  }
-
-  // ❌ Error if no valid source
-  const errorMsg = `Cannot build camera URL for ${cam.name}. ` +
-    `Camera needs either: (1) ip+port for RTSP, or (2) hlsUrl for HLS. ` +
-    `Current: ip=${cam.ip || 'null'}, hlsUrl=${cam.hlsUrl || 'null'}`;
-  
-  log.error({ cameraId: cam.id, name: cam.name }, errorMsg);
-  throw new Error(errorMsg);
-}
 
 // ===================================================================
 // ☁️ POST Frame to AWS Fire Detection Endpoint
@@ -142,31 +75,18 @@ export async function detectFireCloud(cameraUrl, cameraName) {
     log.info({ camera: cameraName }, "🌥️ Starting cloud detection (3 frames)");
 
     // ===================================================================
-    // STEP 1: Grab 3 frames with delay
+    // STEP 1: Grab 3 frames from a SINGLE ffmpeg connection
+    // This fixes the keyframe/GOP bug where separate connections
+    // always start at the same I-frame, producing identical images.
     // ===================================================================
-    const frames = [];
+    const frames = await grabMultipleFrames(cameraUrl, FRAME_COUNT);
     const results = [];
 
-    for (let i = 0; i < FRAME_COUNT; i++) {
-      try {
-        const jpegBuffer = await grabFrameOnce(cameraUrl);
-        frames.push(jpegBuffer);
-        
-        log.debug({ camera: cameraName, frame: i + 1 }, "Frame captured");
-
-        // Wait before next frame (except after last frame)
-        if (i < FRAME_COUNT - 1) {
-          await new Promise(resolve => setTimeout(resolve, FRAME_DELAY_MS));
-        }
-      } catch (error) {
-        log.error({ 
-          camera: cameraName, 
-          frame: i + 1, 
-          error: error.message 
-        }, "Failed to grab frame");
-        throw error;
-      }
+    if (frames.length === 0) {
+      throw new Error("No frames extracted from camera");
     }
+
+    log.debug({ camera: cameraName, framesExtracted: frames.length }, "Frames captured via single connection");
 
     // ===================================================================
     // STEP 2: Send each frame to AWS endpoint
@@ -289,6 +209,5 @@ export async function detectFireCloud(cameraUrl, cameraName) {
 // 📋 Export for use in detectionQueue
 // ===================================================================
 export default {
-  detectFireCloud,
-  buildCameraUrl
+  detectFireCloud
 };

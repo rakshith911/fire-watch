@@ -40,14 +40,21 @@ export async function sendFireAlert(
     // ✅ User is pre-subscribed via standalone script
     // ✅ SNS filtering ensures only the target userId receives the notification
 
-    // Determine Alert Type and Emoji
-    const type = detectionResult.detectionType || "FIRE";
+    // Determine Alert Type and Emoji from specific detection label
+    const type = detectionResult.detectionType || "Fire";
+    const typeLower = type.toLowerCase();
     let emoji = "🔥";
     let title = "Fire Alert";
 
-    if (type === "WEAPON") {
+    if (typeLower === "knife") {
+      emoji = "🔪";
+      title = "Knife Detected";
+    } else if (typeLower === "pistol") {
       emoji = "🔫";
-      title = "Weapon Alert";
+      title = "Pistol Detected";
+    } else if (typeLower === "weapon" || typeLower.includes("weapon")) {
+      emoji = "🔫";
+      title = "Weapon Detected";
     }
 
     const message = `

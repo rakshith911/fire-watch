@@ -44,7 +44,7 @@ export async function initWebSocket(onFireDetection) {
         } else if (data.type === "fire-detection") {
           console.log("🔥 Fire event:", data);
           if (onFireDetectionCallback) {
-            onFireDetectionCallback(data.cameraId, data.isFire);
+            onFireDetectionCallback(data.cameraId, data.isFire, data);
           }
         }
       } catch (err) {
@@ -66,6 +66,16 @@ export async function initWebSocket(onFireDetection) {
     };
   } catch (err) {
     console.error("🚨 Failed to init WebSocket:", err);
+  }
+}
+
+/**
+ * Send a detection event from frontend to backend via WebSocket.
+ * Used by CameraTile to notify backend when YOLO detects fire/weapon.
+ */
+export function sendDetectionEvent(payload) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
   }
 }
 

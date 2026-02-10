@@ -3,6 +3,7 @@ import CameraGrid from "../components/CameraGrid.jsx";
 import SingleCameraView from "../components/SingleCameraView.jsx";
 import MiniStatusPanel from "../components/MiniStatusPanel.jsx";
 import AddCameraDialog from "../components/AddCameraDialog.jsx";
+import { version as appVersion } from "../../package.json";
 import Status from "./Status.jsx";
 import { useAuth } from "../auth/AuthContext.jsx";
 import { useCameras } from "../store/cameras.jsx";
@@ -24,7 +25,7 @@ function Dashboard() {
   const [theme, setTheme] = React.useState(
     document.documentElement.getAttribute("data-theme") || "dark"
   );
-  const { cameras, toggleCameraVisibility } = useCameras();
+  const { cameras, toggleCameraVisibility, showBoundingBoxes, setShowBoundingBoxes } = useCameras();
   const statusPanelRef = React.useRef(null);
 
   // Initialize WebSocket connection for fire detection alerts
@@ -82,17 +83,15 @@ function Dashboard() {
 
               <nav className="toolbar-nav">
                 <button
-                  className={`nav-btn ${
-                    currentPage === "video" ? "active" : ""
-                  }`}
+                  className={`nav-btn ${currentPage === "video" ? "active" : ""
+                    }`}
                   onClick={() => handleNavigate("video")}
                 >
                   Streams
                 </button>
                 <button
-                  className={`nav-btn ${
-                    currentPage === "status" ? "active" : ""
-                  }`}
+                  className={`nav-btn ${currentPage === "status" ? "active" : ""
+                    }`}
                   onClick={() => handleNavigate("status")}
                 >
                   Status
@@ -110,7 +109,7 @@ function Dashboard() {
 
                 <div className="signout-wrapper">
                   <button onClick={logout}>Sign out</button>
-                  <span className="version-text">v0.2.1</span>
+                  <span className="version-text">v{appVersion}</span>
                 </div>
               </div>
             </header>
@@ -118,15 +117,13 @@ function Dashboard() {
             {/* Secondary Toolbar - Only visible on Streams tab */}
             {currentPage === "video" && (
               <div
-                className={`secondary-toolbar ${
-                  isSecondaryToolbarExiting ? "exiting" : ""
-                }`}
+                className={`secondary-toolbar ${isSecondaryToolbarExiting ? "exiting" : ""
+                  }`}
               >
                 <div className="view-controls">
                   <button
-                    className={`view-btn ${
-                      viewMode === "single" ? "active" : ""
-                    }`}
+                    className={`view-btn ${viewMode === "single" ? "active" : ""
+                      }`}
                     onClick={() => handleViewModeChange("single")}
                     title="Single View"
                   >
@@ -150,9 +147,8 @@ function Dashboard() {
                     <span>Single</span>
                   </button>
                   <button
-                    className={`view-btn ${
-                      viewMode === "grid" ? "active" : ""
-                    }`}
+                    className={`view-btn ${viewMode === "grid" ? "active" : ""
+                      }`}
                     onClick={() => handleViewModeChange("grid")}
                     title="Grid View"
                   >
@@ -220,6 +216,19 @@ function Dashboard() {
                     </svg>
                     <span>Status Panel</span>
                   </button>
+
+                  <div className="toggle-wrapper" title="Toggle Bounding Boxes">
+                    <label className="toggle-switch">
+                      <input
+                        type="checkbox"
+                        checked={showBoundingBoxes}
+                        onChange={(e) => setShowBoundingBoxes(e.target.checked)}
+                      />
+                      <span className="slider"></span>
+                    </label>
+                    <span className="toggle-label" onClick={() => setShowBoundingBoxes(!showBoundingBoxes)}>Boxes</span>
+                  </div>
+
                   <div className="add-camera-container">
                     <button
                       className={`view-btn ${showAdd ? "active" : ""}`}
@@ -248,15 +257,14 @@ function Dashboard() {
 
             {currentPage === "video" ? (
               <section
-                className={`content ${
-                  viewMode === "single"
-                    ? showStatusPanel || isExiting
-                      ? "content--single-with-status"
-                      : "content--single"
-                    : showStatusPanel || isExiting
+                className={`content ${viewMode === "single"
+                  ? showStatusPanel || isExiting
+                    ? "content--single-with-status"
+                    : "content--single"
+                  : showStatusPanel || isExiting
                     ? "content--with-status"
                     : "content--grid"
-                }`}
+                  }`}
               >
                 {viewMode === "single" ? (
                   <SingleCameraView

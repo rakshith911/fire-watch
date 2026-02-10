@@ -3,6 +3,7 @@ import { useCameras } from "../store/cameras.jsx";
 import StreamingIcon from "../components/StreamingIcon.jsx";
 import FireStatusButton from "../components/FireStatusButton.jsx";
 import AddCameraDialog from "../components/AddCameraDialog.jsx";
+import { version as appVersion } from "../../package.json";
 import {
   FaEye,
   FaEyeSlash,
@@ -287,7 +288,7 @@ export default function Status({ onNavigate, currentPage = "status" }) {
 
             <div className="signout-wrapper">
               <button onClick={logout}>Sign out</button>
-              <span className="version-text">v0.2.1</span>
+              <span className="version-text">v{appVersion}</span>
             </div>
           </div>
         </header>

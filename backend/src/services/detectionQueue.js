@@ -1,5 +1,5 @@
 import pino from "pino";
-import { detectFire, detectFireMultiFrame, buildCameraUrl } from "./localDetector.js";
+import { detectFire, detectFireMultiFrame, buildCameraUrl, grabFrameOnce } from "./localDetector.js";
 import { detectFireCloud } from "./cloudDetector.js";
 import { detectWeapon } from "./localWeaponDetector.js";
 import livenessValidator from "./livenessValidator.js";
@@ -9,7 +9,6 @@ import {
   isStreamActive,
 } from "./streamManager.js";
 import { sanitizePathName } from "./mediamtxConfigGenerator.js";
-
 import { sendFireAlert } from "./snsService.js";
 import { uploadFireFrame } from "./s3Service.js";
 import { getUserSamplingRate } from "../db/dynamodb.js";
@@ -36,11 +35,20 @@ let samplingWindow = DEFAULT_SAMPLING_WINDOW; // User's sampling window (will be
 // id -> { isFire, lastChecked, consecutiveStatic }
 const cameraStates = new Map();
 
+// Track cameras being watched by frontend YOLO
+// cameraId -> lastTimestamp (Date.now())
+const frontendWatchedCameras = new Map();
+
+// Alert cooldown: prevent repeated SNS alerts for the same camera
+// cameraId -> lastAlertTimestamp (Date.now())
+const lastAlertSent = new Map();
+const ALERT_COOLDOWN_MS = 10 * 1000; // 10 seconds between alerts per camera
+
 // -------------------------------------------------------------------
 // 🔧 Configuration - Multi-Frame Detection (Drone Method)
 // -------------------------------------------------------------------
 const FRAMES_PER_CHECK = 3; // Extract 3 frames per camera turn
-const BOX_IOU_THRESHOLD = 0.85; // 85% overlap = static (increased from 0.8 to reduce false "static" detections)
+const BOX_IOU_THRESHOLD = 0.92; // 92% overlap = static. High threshold means "very hard to be static", easier to be real.
 const STATIC_THRESHOLD = 2; // currently not used to short-circuit, but we track it
 const MIN_CAMERA_INTERVAL = 1000; // Minimum 1 second between cameras
 const MIN_FRAME_INTERVAL = 500; // Minimum 500ms between frames
@@ -169,9 +177,6 @@ async function extractMultipleFramesLocal(camera, currentFrameInterval) {
   if (isStreamActive(camera.id)) {
     try {
       const streamName = sanitizePathName(camera.streamName || camera.name);
-      // Use the SAME stream the user is watching (via MediaMTX)
-      // Append -fire to avoid conflict if needed, or just use the base stream
-      // Using the base stream name as defined in mediamtx.yml
       cameraUrl = `rtsp://localhost:8554/${streamName}-fire`;
       sourceLog = "LOCAL_PROXY";
     } catch (err) {
@@ -328,6 +333,35 @@ async function extractMultipleFramesCloud(camera) {
       "❌ CLOUD detection failed"
     );
     return [];
+  }
+}
+
+// -------------------------------------------------------------------
+// 📡 Handle Frontend Detection Events
+// -------------------------------------------------------------------
+export async function handleFrontendDetection(userId, msg) {
+  const { cameraId, cameraName, boxes, timestamp } = msg;
+
+  // Mark this camera as frontend-watched
+  frontendWatchedCameras.set(cameraId, Date.now());
+
+  // Log only - do NOT alert, do NOT upload to S3, do NOT stop backend
+  log.info({
+    userId,
+    cameraId,
+    cameraName,
+    boxCount: boxes?.length,
+    timestamp,
+  }, "📡 Frontend detection received (logging only)");
+
+  // Broadcast fire status to all WebSocket clients (for UI sync)
+  if (broadcastFireDetection && boxes && boxes.length > 0) {
+    broadcastFireDetection(userId, cameraId, cameraName, true, {
+      boxes: boxes,
+      alertType: "Fire", // Frontend YOLO is primarily Fire
+      confidence: boxes[0]?.[5] || 0.9,
+      source: "frontend-yolo",
+    });
   }
 }
 
@@ -520,6 +554,9 @@ async function startQueueLoop() {
 
     const state = cameraStates.get(camera.id);
 
+    // SKIP LOGIC REMOVED: Backend detection now runs regardless of frontend state
+    // We want the backend to be the source of truth for alerts.
+
     try {
       const currentCameraInterval = calculateCameraInterval(
         samplingWindow,
@@ -581,8 +618,15 @@ async function startQueueLoop() {
           `✅ ${detectionType}: No detection in any frame`
         );
 
+        // Broadcast clear if transitioning from fire → no fire
+        if (state.isFire && broadcastFireDetection) {
+          broadcastFireDetection(camera.userId, camera.id, camera.name, false);
+        }
+
         state.isFire = false;
         state.consecutiveStatic = 0;
+        // Clear alert cooldown so next real detection triggers immediately
+        lastAlertSent.delete(camera.id);
       } else {
         // Detection found!
         log.warn(
@@ -597,17 +641,12 @@ async function startQueueLoop() {
         // -------------------------------------------------------------------
         // 🧠 IoU Analysis (Static vs Real Fire)
         // -------------------------------------------------------------------
-        // For WEAPONS, we bypass the static check as real weapons don't move like fire?
-        // Actually, let's keep it simple:
-        // If WEAPON -> Immediate Alert (No IoU check needed for now, or loose check)
-        // If FIRE -> Strict IoU check
 
         let isRealDetection = false;
         let iouAnalysis = null;
 
         if (detectionType === "CLOUD") {
           // 🌥️ CLOUD: IoU/static detection already handled by cloud endpoint
-          // If we got frames back, it means cloud confirmed real fire
           const cloudResult = frames[0]?.cloudResult;
           if (cloudResult && cloudResult.isFire) {
             isRealDetection = true;
@@ -618,126 +657,161 @@ async function startQueueLoop() {
             );
           }
         } else if (detectionType === "WEAPON") {
-          // 🔫 WEAPON: Use Multi-Frame Consistency + Motion + Depth
-          // Real weapon criteria (any one of these):
-          // 1. Must be detected in 2+ frames (consistency) AND
-          // 2. Has movement (IoU < 0.95) OR high confidence (>0.7) OR is 3D (depth variance)
-          // Depth check helps distinguish real weapons from flat posters/phone images
-
+          // 🔫 WEAPON: Multi-frame analysis for liveness
+          // We rely on either movement (IoU) OR high confidence to allow static weapons
           const framesWithBoxes = frames.filter(f => f.boxes && f.boxes.length > 0);
 
           if (framesWithBoxes.length >= 2) {
-            // Check for motion between frames (boxes should move slightly if real)
-            iouAnalysis = analyzeBoxes(frames);
-            const avgIoU = parseFloat(iouAnalysis.avgIoU || "0");
-            const maxConfidence = Math.max(...framesWithBoxes.map(f => f.boxes[0][5]));
+            const iouResult = analyzeBoxes(framesWithBoxes);
+            const avgIoU = parseFloat(iouResult.avgIoU || "0");
+            const maxConfidence = framesWithBoxes.reduce((max, f) => Math.max(max, f.boxes[0]?.[5] || 0), 0);
 
+            // Real weapon criteria:
+            // - Some movement (IoU < 0.95) indicating it's not a static poster
+            // - OR very high confidence (> 0.60) even if static (person holding still)
             const hasMovement = avgIoU < 0.95;
-            const highConfidence = maxConfidence > 0.5;  // Lowered from 0.7 - weapon model often scores 0.4-0.6
-
-            // Depth check: real weapons (even thin knives) have depth from hand/handle/background
-            // Posters/phone images are completely flat (stdDev ≈ 0)
-            const lastFrame = framesWithBoxes[framesWithBoxes.length - 1];
-            const bbox = lastFrame.boxes[0];
-            const is3D = await livenessValidator.isWeapon3D(lastFrame.frameBuffer, bbox);
+            const highConfidence = maxConfidence > 0.60;
 
             log.info({
               framesDetected: framesWithBoxes.length,
               avgIoU,
               maxConfidence: maxConfidence.toFixed(3),
               hasMovement,
-              highConfidence,
-              is3D
-            }, "🔫 WEAPON: Multi-frame + Depth analysis");
+              highConfidence
+            }, "🔫 WEAPON: Multi-frame analysis");
 
-            if (hasMovement || highConfidence || is3D) {
+            if (hasMovement || highConfidence) {
               isRealDetection = true;
-              const reason = hasMovement ? 'Movement detected' : (highConfidence ? 'High confidence' : '3D depth detected');
-              log.info(`🔫 WEAPON: Liveness PASSED (${reason})`);
+              log.info(`🔫 WEAPON: Liveness PASSED (${hasMovement ? 'Movement detected' : 'High confidence'})`);
             } else {
-              log.warn("⚠️ WEAPON: Liveness FAILED (Static + Low confidence + 2D flat - likely poster)");
+              log.info("🔫 WEAPON: REJECTED — Static or low confidence");
             }
           } else {
-            log.warn({ framesDetected: framesWithBoxes.length }, "⚠️ WEAPON: Not enough frames with detection");
+            // Check if we have at least 1 very high confidence frame (> 0.8) to rescue?
+            // User complained about "pause" not working (albeit for Fire). 
+            // For weapons, if we only catch 1 frame but it's 0.9 confidence, should we alert?
+            // "can you find out if its done?" -> "the weapons detection in the code is not working due to the liveliness check"
+            // Let's stick to requiring 2 frames for now to avoid transient noise.
+            log.warn({ framesDetected: framesWithBoxes.length }, "⚠️ WEAPON: Not enough frames with detection (>1 needed)");
           }
         } else if (detectionType === "BOTH") {
-          // 🔥🔫 BOTH: Frames are tagged with aiType "FIRE" or "WEAPON"
-          // Separate them and validate each type independently
+          // 🔥🔫 BOTH
           const fireFrames = frames.filter(f => f.aiType === "FIRE");
           const weaponFrames = frames.filter(f => f.aiType === "WEAPON");
 
           if (fireFrames.length >= 2) {
             const fireIou = analyzeBoxes(fireFrames);
-            if (!fireIou.isStatic) {
-              const lastFire = fireFrames[fireFrames.length - 1];
-              const bbox = lastFire.boxes[0];
-              const frameBuffers = fireFrames.map(f => f.frameBuffer);
-              const isFlickering = await livenessValidator.isFireMoving(frameBuffers, bbox);
-              if (isFlickering) {
-                isRealDetection = true;
-                iouAnalysis = fireIou;
-                // Override detectionType for the alert
-                frames._fireConfirmed = true;
-                log.info("🔥 BOTH/FIRE: Liveness Check PASSED (Flickering Motion)");
-              } else {
-                log.warn("⚠️ BOTH/FIRE: Liveness Check FAILED (Static Pixels)");
+
+            // Check pixel motion if static
+            let isFireReal = !fireIou.isStatic;
+            if (!isFireReal && fireFrames.length >= 3) {
+              const fireBoxes = fireFrames.map(f => f.boxes[0]).filter(b => b);
+              if (fireBoxes.length > 0) {
+                const pixelMotion = await livenessValidator.isFireMoving(
+                  fireFrames.map(f => f.frameBuffer),
+                  fireFrames.map(f => f.boxes[0])
+                );
+                if (pixelMotion > 0.15) {
+                  isFireReal = true;
+                  fireIou.reason = "pixel_motion_rescue";
+                  log.warn({ pixelMotion }, "🔥 BOTH/FIRE: RESCUED by pixel motion test!");
+                }
+              }
+            }
+
+            if (isFireReal) {
+              isRealDetection = true;
+              iouAnalysis = fireIou;
+              frames._fireConfirmed = true;
+              log.info({ ...fireIou }, "🔥 BOTH/FIRE: REAL — confirmed");
+            } else {
+              log.warn({ ...fireIou }, "⚠️ BOTH/FIRE: REJECTED — static boxes");
+            }
+          }
+
+          if (weaponFrames.length >= 1) {
+            // Dual-Threshold for BOTH mode too
+            const WEAK_THRESHOLD = 0.40;
+            const STRONG_THRESHOLD = 0.75;
+
+            const weakFrames = weaponFrames.filter(f => f.boxes && f.boxes.length > 0 && f.boxes[0][5] >= WEAK_THRESHOLD);
+            const strongFrames = weakFrames.filter(f => f.boxes[0][5] >= STRONG_THRESHOLD);
+
+            if (strongFrames.length >= 1 && weakFrames.length >= 1) {
+              // In BOTH mode, we might only catch 1 or 2 frames total because we only grab 3?
+              // Actually extractMultipleFramesLocal grabs 3 for fire + 3 for weapon = 6 frames?
+              // No, wait. "if (aiType === "BOTH")" -> loop 3 times for weapon, then calls detectFireMultiFrame...
+              // It's sequential. So we DO have 3 weapon frames.
+              // So we should enforce "weakFrames.length >= 2" ideally, OR just 1 strong + 1 weak?
+              // Let's stick to the same logic: Strong >= 1 AND Weak >= 2.
+
+              if (weakFrames.length >= 2) {
+                const bestFrame = strongFrames.reduce((best, f) => {
+                  const conf = f.boxes[0]?.[5] || 0;
+                  return conf > (best?.boxes[0]?.[5] || 0) ? f : best;
+                }, strongFrames[0]);
+
+                const bbox = bestFrame.boxes[0];
+                const is3D = await livenessValidator.isWeapon3D(bestFrame.frameBuffer, bbox);
+
+                if (is3D) {
+                  isRealDetection = true;
+                  frames._weaponConfirmed = true;
+                  log.info({ label: bbox[4], confidence: bbox[5]?.toFixed(3) },
+                    "🔫 BOTH/WEAPON: PASSED — 3D real object");
+                } else {
+                  log.info("🔫 BOTH/WEAPON: REJECTED — 2D flat object (photo/screen)");
+                }
               }
             }
           }
-
-          if (weaponFrames.length >= 2) {
-            const weaponIou = analyzeBoxes(weaponFrames);
-            const avgIoU = parseFloat(weaponIou.avgIoU || "0");
-            const framesWithBoxes = weaponFrames.filter(f => f.boxes && f.boxes.length > 0);
-            const maxConfidence = Math.max(...framesWithBoxes.map(f => f.boxes[0][5]));
-            const hasMovement = avgIoU < 0.95;
-            const highConfidence = maxConfidence > 0.5;
-
-            const lastWeapon = framesWithBoxes[framesWithBoxes.length - 1];
-            const bbox = lastWeapon.boxes[0];
-            const is3D = await livenessValidator.isWeapon3D(lastWeapon.frameBuffer, bbox);
-
-            if (hasMovement || highConfidence || is3D) {
-              isRealDetection = true;
-              iouAnalysis = iouAnalysis || weaponIou;
-              frames._weaponConfirmed = true;
-              const reason = hasMovement ? 'Movement detected' : (highConfidence ? 'High confidence' : '3D depth detected');
-              log.info(`🔫 BOTH/WEAPON: Liveness PASSED (${reason})`);
-            } else {
-              log.warn("⚠️ BOTH/WEAPON: Liveness FAILED (Static + Low confidence + 2D flat)");
-            }
-          }
         } else {
-          // 🔥 FIRE: Perform IoU check AND Pixel Motion check
+          // 🔥 FIRE detection logic
           iouAnalysis = analyzeBoxes(frames);
 
           if (!iouAnalysis.isStatic) {
-            // IoU says boxes are moving/shifting (good), now check pixel motion (flicker)
-            const lastFrame = frames[frames.length - 1];
-            const bbox = lastFrame.boxes[0];
-            const frameBuffers = frames.map(f => f.frameBuffer);
-
-            const isFlickering = await livenessValidator.isFireMoving(frameBuffers, bbox);
-
-            if (isFlickering) {
-              isRealDetection = true;
-              log.info("🔥 FIRE: Liveness Check PASSED (Flickering Motion)");
-            } else {
-              log.warn("⚠️ FIRE: Liveness Check FAILED (Static Pixels) - Ignoring");
-            }
+            isRealDetection = true;
+            log.info({ ...iouAnalysis },
+              `🔥 FIRE: REAL — boxes moving (IoU ${iouAnalysis.avgIoU} < ${BOX_IOU_THRESHOLD})`);
           } else {
-            log.warn(
-              { ...iouAnalysis },
-              `⚠️ STATIC FIRE DETECTED (IoU ${iouAnalysis.avgIoU} > ${BOX_IOU_THRESHOLD}) - Likely poster/TV`
-            );
+            // 🚨 RESCUE MISSION: Check pixel motion
+            log.warn({ ...iouAnalysis },
+              `⚠️ FIRE STATIC: Checking pixel motion for rescue...`);
+
+            if (frames.length >= 3) {
+              const bestBox = frames[0].boxes[0];
+              if (bestBox) {
+                const pixelRatio = await livenessValidator.isFireMoving(
+                  frames.map(f => f.frameBuffer),
+                  frames.map(f => f.boxes[0])
+                );
+
+                // Threshold > 0.15 = real fire/video
+                if (pixelRatio > 0.15) {
+                  isRealDetection = true;
+                  iouAnalysis.reason = "pixel_motion_rescue";
+                  iouAnalysis.pixelRatio = pixelRatio;
+                  log.warn({ pixelRatio }, "🔥 FIRE: RESCUED! Boxes static but pixels are moving (real video/fire)");
+                } else {
+                  log.warn({ pixelRatio }, "⚠️ FIRE: REJECTED. Pixel motion too low (photo/poster)");
+                }
+              }
+            }
           }
         }
 
         if (isRealDetection) {
-          // For BOTH mode, determine the specific alert type(s)
-          const alertType = detectionType === "BOTH"
-            ? (frames._fireConfirmed ? "FIRE" : "WEAPON")
-            : detectionType;
+          // Determine the specific alert type — use actual weapon label (Knife/Pistol) instead of generic "WEAPON"
+          const lastFrameForLabel = frames[frames.length - 1];
+          const topBoxLabel = lastFrameForLabel?.boxes?.[0]?.[4] || null;
+          let alertType;
+          if (detectionType === "BOTH") {
+            alertType = frames._fireConfirmed ? "Fire" : (topBoxLabel || "Weapon");
+          } else if (detectionType === "WEAPON") {
+            alertType = topBoxLabel || "Weapon";
+          } else {
+            alertType = "Fire";
+          }
 
           log.error(
             {
@@ -752,52 +826,82 @@ async function startQueueLoop() {
           state.isFire = true; // Used for UI status (red border)
           state.consecutiveStatic = 0;
 
+          // Get the last frame for broadcast + SNS alert
+          const lastFrame = frames[frames.length - 1];
+
+          log.info({
+            id: camera.id,
+            boxes: lastFrame.boxes,
+            frameBufferSize: lastFrame.frameBuffer?.length,
+          }, "📦 Box coordinates being sent");
+
           // Broadcast to WebSocket
           if (broadcastFireDetection) {
-            broadcastFireDetection(camera.userId, camera.id, camera.name, true);
+            broadcastFireDetection(camera.userId, camera.id, camera.name, true, {
+              boxes: lastFrame.boxes, alertType, confidence: lastFrame.confidence
+            });
           }
 
-          // Send SNS Alert with Frame
-          const lastFrame = frames[frames.length - 1];
+          // Send SNS Alert with Frame (cooldown: max once per 5 minutes per camera)
           if (lastFrame && lastFrame.frameBuffer) {
-            try {
-              const imageUrl = await uploadFireFrame(
-                camera.id,
-                lastFrame.frameBuffer
-              );
+            const now = Date.now();
+            const lastAlert = lastAlertSent.get(camera.id) || 0;
+            if (now - lastAlert > ALERT_COOLDOWN_MS) {
+              lastAlertSent.set(camera.id, now);
+              try {
+                const imageUrl = await uploadFireFrame(
+                  camera.id,
+                  lastFrame.frameBuffer,
+                  lastFrame.boxes
+                );
 
-              await sendFireAlert(
-                camera.userId,
-                camera.id,
-                camera.name,
-                {
-                  isFire: true,
-                  detectionType: alertType, // Send specific type (FIRE or WEAPON), not "BOTH"
-                  confidence: lastFrame.confidence,
-                  fireCount: lastFrame.fireCount,
-                  smokeCount: lastFrame.smokeCount,
-                  iouAnalysis,
-                },
-                imageUrl
-              );
+                await sendFireAlert(
+                  camera.userId,
+                  camera.id,
+                  camera.name,
+                  {
+                    isFire: true,
+                    detectionType: alertType,
+                    confidence: lastFrame.confidence,
+                    fireCount: lastFrame.fireCount,
+                    smokeCount: lastFrame.smokeCount,
+                    iouAnalysis,
+                  },
+                  imageUrl
+                );
 
-              log.info(`✅ SNS ${alertType} alert with image sent successfully`);
-            } catch (error) {
-              log.error(
-                {
-                  userId: camera.userId,
-                  cameraId: camera.id,
-                  error: error.message,
-                },
-                "❌ SNS alert with image failed"
-              );
+                log.info(`✅ SNS ${alertType} alert with image sent successfully`);
+              } catch (error) {
+                log.error(
+                  {
+                    userId: camera.userId,
+                    cameraId: camera.id,
+                    error: error.message,
+                  },
+                  "❌ SNS alert with image failed"
+                );
+              }
+            } else {
+              log.info({
+                cameraId: camera.id,
+                alertType,
+                cooldownRemaining: `${((ALERT_COOLDOWN_MS - (now - lastAlert)) / 1000).toFixed(0)}s`
+              }, "⏳ SNS alert suppressed — cooldown active");
             }
           }
         } else {
-          // Static detection (Fire only)
+          // Static/liveness failed — not a real detection
           state.consecutiveStatic++;
+          if (state.isFire && broadcastFireDetection) {
+            broadcastFireDetection(camera.userId, camera.id, camera.name, false);
+          }
           state.isFire = false;
-          log.info("🚫 Alert suppressed - static detection");
+          log.info({
+            id: camera.id,
+            name: camera.name,
+            detectionType,
+            framesWithDetection: frames.length,
+          }, "🚫 Alert suppressed — liveness/depth check failed");
         }
       }
     } catch (error) {
@@ -806,10 +910,18 @@ async function startQueueLoop() {
           id: camera.id,
           name: camera.name,
           error: error.message,
+          stack: error.stack?.split('\n').slice(0, 3).join(' | '),
         },
         "❌ Detection error"
       );
     }
+
+    log.info({
+      id: camera.id,
+      name: camera.name,
+      result: state.isFire ? "🔴 FIRE/WEAPON" : "🟢 CLEAR",
+      nextCamera: cameraQueue[(currentIndex + 1) % cameraQueue.length]?.name,
+    }, `━━━ Detection cycle complete for ${camera.name} ━━━`);
 
     currentIndex = (currentIndex + 1) % cameraQueue.length;
 
@@ -932,6 +1044,8 @@ export async function stopDetectionQueue() {
 
   cameraQueue = [];
   cameraStates.clear();
+  lastAlertSent.clear();
+  frontendWatchedCameras.clear();
   currentIndex = 0;
   currentUserId = null;
   samplingWindow = DEFAULT_SAMPLING_WINDOW;
