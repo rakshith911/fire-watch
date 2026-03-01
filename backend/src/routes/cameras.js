@@ -249,8 +249,14 @@ cameras.put("/:id", async (req, res) => {
     if (req.body.aiType) {
       const validAiTypes = [
         "FIRE",
+        "FIRE_YOLO",
+        "FIRE_DETECTRON",
         "WEAPON",
+        "WEAPON_YOLO",
+        "WEAPON_DETECTRON",
         "BOTH",
+        "BOTH_YOLO",
+        "BOTH_DETECTRON",
       ];
       if (!validAiTypes.includes(req.body.aiType)) {
         return res.status(400).json({

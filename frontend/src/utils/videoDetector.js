@@ -12,7 +12,7 @@ export class VideoDetector {
     workerUrl = "/src/utils/worker-client.js",
     modelInputSize = 640, // YOLO input side (square)
     throttleMs = 60, // ~16ms=60fps, 33ms=30fps, 60ms~16fps
-    onDetections = () => {}, // callback(boxes) per frame
+    onDetections = () => { }, // callback(boxes) per frame
   }) {
     this.source = source;
     this.id = id || `detector-${Math.random().toString(36).slice(2)}`;
@@ -88,20 +88,6 @@ export class VideoDetector {
     this.stop();
     if (this._root && this._container) this._root.removeChild(this._container);
   }
-
-  // async attachWebRTC(stream) {
-  //   this.render(); // ensure video/canvas exist
-  //   const setSizes = () => {
-  //     if (!this._video.videoWidth) return;
-  //     this._overlay.width  = this._video.videoWidth;
-  //     this._overlay.height = this._video.videoHeight;
-  //   };
-  //   this._video.srcObject = stream;
-  //   this._video.addEventListener('loadedmetadata', setSizes, { once: true });
-  //   try { await this._video.play(); } catch {}
-  //   if (!this._worker) this._spawnWorker();
-  //   this._bindVideoLoop();
-  // }
 
   async attachWebRTC(stream) {
     this.render(); // ensure UI exists
@@ -260,12 +246,26 @@ export class VideoDetector {
       );
 
       this._worker.onmessage = (evt) => {
-        const output = evt.data;
-        this._boxes = this._processOutput(
-          output,
-          this._overlay.width,
-          this._overlay.height
-        );
+        const raw = evt.data;
+        const data = raw.data || raw; // Handle {data, dims} or just data
+        const dims = raw.dims || null;
+
+        // If using weapon model logic directly (not typical for default handler but safer)
+        if (this._worker.name && this._worker.name.includes("weapon")) {
+          this._boxes = this._processOutputWeapon(
+            data,
+            this._overlay.width,
+            this._overlay.height,
+            dims
+          );
+        } else {
+          this._boxes = this._processOutput(
+            data,
+            this._overlay.width,
+            this._overlay.height
+          );
+        }
+
         this.onDetections(this._boxes);
         this._busy = false;
       };
@@ -350,12 +350,25 @@ export class VideoDetector {
       });
     }
 
-    // draw the current video frame into the scratch canvas at model size
-    // this._scratchCtx.drawImage(this._video, 0, 0, S, S);
+    const vw = this._video.videoWidth;
+    const vh = this._video.videoHeight;
+    if (!vw || !vh) return null;
 
-    // const data = this._scratchCtx.getImageData(0, 0, S, S).data;
+    // Letterbox: maintain aspect ratio, pad with gray (114,114,114) — matches backend
+    const scale = Math.min(S / vw, S / vh);
+    const newW = Math.round(vw * scale);
+    const newH = Math.round(vh * scale);
+    const padX = (S - newW) / 2;
+    const padY = (S - newH) / 2;
 
-    this._scratchCtx.drawImage(this._video, 0, 0, S, S);
+    // Store letterbox params for coordinate un-mapping
+    this._letterbox = { scale, padX, padY };
+
+    // Fill with gray padding then draw scaled video
+    this._scratchCtx.fillStyle = "rgb(114,114,114)";
+    this._scratchCtx.fillRect(0, 0, S, S);
+    this._scratchCtx.drawImage(this._video, padX, padY, newW, newH);
+
     let data;
     try {
       data = this._scratchCtx.getImageData(0, 0, S, S).data;
@@ -397,6 +410,9 @@ export class VideoDetector {
     const clsCount = 3; // Fire/Smoke/Other
     const probThreshold = 0.2;
 
+    // Letterbox params for coordinate un-mapping (set by _prepareInput)
+    const lb = this._letterbox || { scale: imgW / 640, padX: 0, padY: 0 };
+
     for (let i = 0; i < cells; i++) {
       // pick max-prob class
       let classId = 0,
@@ -415,10 +431,11 @@ export class VideoDetector {
       const w = output[2 * cells + i];
       const h = output[3 * cells + i];
 
-      const x1 = ((xc - w / 2) / 640) * imgW;
-      const y1 = ((yc - h / 2) / 640) * imgH;
-      const x2 = ((xc + w / 2) / 640) * imgW;
-      const y2 = ((yc + h / 2) / 640) * imgH;
+      // Un-map from 640x640 letterbox to original video coordinates
+      const x1 = Math.max(0, (xc - w / 2 - lb.padX) / lb.scale);
+      const y1 = Math.max(0, (yc - h / 2 - lb.padY) / lb.scale);
+      const x2 = Math.min(imgW, (xc + w / 2 - lb.padX) / lb.scale);
+      const y2 = Math.min(imgH, (yc + h / 2 - lb.padY) / lb.scale);
 
       const label = ["Fire", "Smoke", "Other"][classId];
       boxes.push([x1, y1, x2, y2, label, best]);
@@ -497,35 +514,90 @@ export class VideoDetector {
     return keep;
   }
 
-  _processOutputWeapon(output, imgW, imgH) {
-    // YOLO column-major format: [1, (4+C), 8400] in 640px space
-    // Same structure as fire model but with weapon classes
+  _processOutputWeapon(output, imgW, imgH, dims) {
+    // Adaptive parsing for YOLOv8 (Standard) vs YOLO11 (Transposed)
     let boxes = [];
-    const cells = 8400;
-    const clsCount = 2; // Knife, Pistol
-    const probThreshold = 0.55;
-    const labels = ["Knife", "Pistol"];
+    const labels = ["Knife", "Pistol", "Rifle"]; // MATCH BACKEND
+    const probThreshold = 0.35; // Lower for frontend drawing; backend 3D check gates alerts
+    let clsCount = 3;
 
-    for (let i = 0; i < cells; i++) {
-      // pick max-prob class
-      let classId = 0, best = 0;
-      for (let c = 0; c < clsCount; c++) {
-        const p = output[cells * (c + 4) + i];
-        if (p > best) { best = p; classId = c; }
+    let isTransposed = false;
+    let cells = 8400;
+
+    // Letterbox params for coordinate un-mapping (set by _prepareInput)
+    const lb = this._letterbox || { scale: imgW / 640, padX: 0, padY: 0 };
+
+    // Auto-detect layout from dims
+    if (dims && dims.length === 3) {
+      // dims is [1, C, N] or [1, N, C]
+      const d1 = dims[1];
+      const d2 = dims[2];
+
+      if (d1 > d2) {
+        // [1, 8400, C] -> Transposed (Interleaved)
+        isTransposed = true;
+        cells = d1;
+        clsCount = d2 - 4; // Dynamically calculate classes (e.g., 7 - 4 = 3)
+      } else {
+        // [1, C, 8400] -> Standard (Planar-ish)
+        cells = d2;
+        clsCount = d1 - 4;
       }
-      if (best < probThreshold) continue;
+    }
 
-      const xc = output[i];
-      const yc = output[cells + i];
-      const w  = output[2 * cells + i];
-      const h  = output[3 * cells + i];
+    if (isTransposed) {
+      // Transposed: [1, 8400, 4+C] -> [x, y, w, h, class0, class1...] per row
+      const stride = 4 + clsCount;
 
-      const x1 = ((xc - w / 2) / 640) * imgW;
-      const y1 = ((yc - h / 2) / 640) * imgH;
-      const x2 = ((xc + w / 2) / 640) * imgW;
-      const y2 = ((yc + h / 2) / 640) * imgH;
+      for (let i = 0; i < cells; i++) {
+        const offset = i * stride;
 
-      boxes.push([x1, y1, x2, y2, labels[classId], best]);
+        // Find best class
+        let classId = 0, best = 0;
+        for (let c = 0; c < clsCount; c++) {
+          const p = output[offset + 4 + c];
+          if (p > best) { best = p; classId = c; }
+        }
+
+        if (best < probThreshold) continue;
+
+        const xc = output[offset];
+        const yc = output[offset + 1];
+        const w = output[offset + 2];
+        const h = output[offset + 3];
+
+        // Un-map from 640x640 letterbox to original video coordinates
+        const x1 = Math.max(0, (xc - w / 2 - lb.padX) / lb.scale);
+        const y1 = Math.max(0, (yc - h / 2 - lb.padY) / lb.scale);
+        const x2 = Math.min(imgW, (xc + w / 2 - lb.padX) / lb.scale);
+        const y2 = Math.min(imgH, (yc + h / 2 - lb.padY) / lb.scale);
+
+        boxes.push([x1, y1, x2, y2, labels[classId] || "Unknown", best]);
+      }
+    } else {
+      // Standard: [1, 4+C, 8400] -> Planar (all Xs, then all Ys...)
+      for (let i = 0; i < cells; i++) {
+        // pick max-prob class
+        let classId = 0, best = 0;
+        for (let c = 0; c < clsCount; c++) {
+          const p = output[cells * (c + 4) + i];
+          if (p > best) { best = p; classId = c; }
+        }
+        if (best < probThreshold) continue;
+
+        const xc = output[i];
+        const yc = output[cells + i];
+        const w = output[2 * cells + i];
+        const h = output[3 * cells + i];
+
+        // Un-map from 640x640 letterbox to original video coordinates
+        const x1 = Math.max(0, (xc - w / 2 - lb.padX) / lb.scale);
+        const y1 = Math.max(0, (yc - h / 2 - lb.padY) / lb.scale);
+        const x2 = Math.min(imgW, (xc + w / 2 - lb.padX) / lb.scale);
+        const y2 = Math.min(imgH, (yc + h / 2 - lb.padY) / lb.scale);
+
+        boxes.push([x1, y1, x2, y2, labels[classId], best]);
+      }
     }
 
     // NMS

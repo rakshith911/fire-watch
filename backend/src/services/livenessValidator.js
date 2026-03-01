@@ -174,9 +174,11 @@ class LivenessValidator {
             }
 
             // Decision logic:
-            const DEPTH_THRESHOLD = 0.15;     // center region depth variance
-            const DIFF_THRESHOLD = 0.3;        // depth difference vs background
-            const FLAT_SCREEN_THRESHOLD = 0.05; // ultra-center flatness (phone screen)
+            // Thresholds tuned for real weapons (knives are inherently flat objects,
+            // so internal depth variance is low even for real ones)
+            const DEPTH_THRESHOLD = 0.05;      // center region depth variance (lowered: real knives have ~0.05-0.10)
+            const DIFF_THRESHOLD = 0.18;       // depth difference vs background (lowered: real objects at ~0.20+)
+            const FLAT_SCREEN_THRESHOLD = 0.03; // ultra-center flatness (lowered: only flag truly dead-flat phone screens)
 
             const passes3D = insideStdDev > DEPTH_THRESHOLD || depthDiff > DIFF_THRESHOLD;
             // Phone screen trap: bbox looks 3D overall (hand included) but the

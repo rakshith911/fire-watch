@@ -22,7 +22,11 @@ const s3 = new S3Client({
 });
 
 const BUCKET_NAME = process.env.S3_BUCKET_MODELS;
-const MODELS_DIR = path.join(BACKEND_ROOT, "models");
+
+// Use override if available (e.g. for Electron user data), otherwise default to backend/models
+const MODELS_DIR = process.env.MODELS_DIR_OVERRIDE
+    ? process.env.MODELS_DIR_OVERRIDE
+    : path.join(BACKEND_ROOT, "models");
 
 if (!fs.existsSync(MODELS_DIR)) {
     fs.mkdirSync(MODELS_DIR, { recursive: true });
@@ -65,7 +69,7 @@ async function main() {
             return;
         }
 
-        const allowedModels = ["best.onnx", "weapons.onnx", "depth_anything_v2_small.onnx"];
+        const allowedModels = ["best.onnx", "weapons.onnx", "depth_anything_v2_small.onnx", "yolov11n_bestFire.onnx", "weapons_yolo.onnx"];
 
         for (const item of data.Contents) {
             const fileName = item.Key;

@@ -174,7 +174,7 @@ export function CamerasProvider({ children }) {
   });
 
   // Global toggle for bounding boxes
-  const [showBoundingBoxes, setShowBoundingBoxes] = useState(false);
+  const [showBoundingBoxes, setShowBoundingBoxes] = useState(true);
 
   // Fetch cameras from API in DB mode
   useEffect(() => {

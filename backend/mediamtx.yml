@@ -1,14 +1,16 @@
 logLevel: info
 hls: true
 hlsAddress: ':8888'
-hlsAllowOrigin: '*'
+hlsAllowOrigins:
+  - '*'
 hlsVariant: lowLatency
 hlsSegmentCount: 3
 hlsSegmentDuration: 1s
 hlsPartDuration: 200ms
 webrtc: true
 webrtcAddress: ':8889'
-webrtcAllowOrigin: '*'
+webrtcAllowOrigins:
+  - '*'
 webrtcLocalUDPAddress: ':8189'
 webrtcLocalTCPAddress: ':8189'
 webrtcIPsFromInterfaces: false
@@ -18,4 +20,5 @@ rtsp: true
 rtspAddress: ':8554'
 readTimeout: 10s
 writeTimeout: 10s
+writeQueueSize: 2048
 paths: {}

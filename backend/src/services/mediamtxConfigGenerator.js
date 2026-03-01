@@ -143,7 +143,7 @@ function buildCameraPathConfig(cam) {
 
   if ((cam.streamType === "RTSP" || cam.streamType === "WEBRTC") && cam.ip) {
     pathConfig.source = buildRTSPUrl(cam);
-    pathConfig.rtspTransport = "tcp";  // Force TCP to avoid UDP packet loss
+    pathConfig.sourceProtocol = "tcp";  // Force TCP to avoid UDP packet loss
   } else if (cam.streamType === "HLS" && cam.hlsUrl) {
     pathConfig.source = cam.hlsUrl;
   }

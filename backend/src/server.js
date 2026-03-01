@@ -35,10 +35,35 @@ const __dirname = path.dirname(__filename);
 // ===================================================================
 // 🔧 Configuration Constants
 // ===================================================================
-const DEFAULT_SAMPLING_RATE = 30000; // 30 seconds default sampling window
+
 
 // ✅ Track current user (starts as null, set dynamically on login)
 let currentUserId = null;
+
+// -------------------------------------------------------------------
+// 📥 Model Download Trigger
+// -------------------------------------------------------------------
+import { spawn } from "child_process";
+const downloadScript = path.join(__dirname, "../scripts/download-models.js");
+
+function ensureModels() {
+  log.info("📥 Checking/Downloading models...");
+  const downloader = spawn("node", [downloadScript], {
+    stdio: "inherit",
+    env: process.env // Pass current env (including overrides)
+  });
+
+  downloader.on("close", (code) => {
+    if (code === 0) {
+      log.info("✅ Models check complete");
+    } else {
+      log.error({ code }, "❌ Model download failed");
+    }
+  });
+}
+
+// Trigger on start
+ensureModels();
 
 // -------------------------------------------------------------------
 // 🧠 WebSocket setup with JWT authentication
@@ -75,9 +100,9 @@ wss.on("connection", async (ws, req) => {
 
     // ✅ ENSURE USER EXISTS: Create user with default settings if not exists
     try {
-      const user = await dynamodb.ensureUser(userId, DEFAULT_SAMPLING_RATE);
+      const user = await dynamodb.ensureUser(userId);
       log.info(
-        { userId, samplingRate: user.samplingRate },
+        { userId },
         "📋 User settings loaded/initialized"
       );
     } catch (error) {
@@ -189,11 +214,11 @@ wss.on("connection", async (ws, req) => {
 // -------------------------------------------------------------------
 export function broadcastFireDetection(userId, id, cameraName, isFire, metadata = {}) {
   log.info(
-    { 
-      userId, 
-      id, 
-      cameraName, 
-      isFire, 
+    {
+      userId,
+      id,
+      cameraName,
+      isFire,
       totalUsers: wsClients.size,
       hasMetadata: Object.keys(metadata).length > 0
     },
@@ -294,8 +319,9 @@ app.get("/diagnostics", async (_req, res) => {
 
   const requiredModels = [
     "best.onnx",
+    "yolov11n_bestFire.onnx",
     "weapons.onnx",
-    "theft.onnx",
+    "weapons_yolo.onnx",
     "depth_anything_v2_small.onnx"
   ];
 
@@ -361,8 +387,10 @@ function checkModelsAtStartup() {
     : path.resolve(__dirname, "../models");
 
   const requiredModels = [
-    { name: "best.onnx", purpose: "Fire Detection" },
-    { name: "weapons.onnx", purpose: "Weapon Detection" },
+    { name: "best.onnx", purpose: "Fire Detection (Detectron)" },
+    { name: "yolov11n_bestFire.onnx", purpose: "Fire Detection (YOLO)" },
+    { name: "weapons.onnx", purpose: "Weapon Detection (Detectron)" },
+    { name: "weapons_yolo.onnx", purpose: "Weapon Detection (YOLO)" },
     { name: "depth_anything_v2_small.onnx", purpose: "Liveness/Depth Check" },
   ];
 

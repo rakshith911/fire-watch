@@ -52,9 +52,21 @@ self.onmessage = async (event) => {
     const t0 = performance.now();
     const outputs = await session.run({ images: tensor });
     const t1 = performance.now();
-    if (Math.random() < 0.05) console.log(`[weapon-worker] inference: ${(t1-t0).toFixed(0)}ms`);
-    const first = outputs[Object.keys(outputs)[0]];
-    self.postMessage(first.data);
+    if (Math.random() < 0.05) console.log(`[weapon-worker] inference: ${(t1 - t0).toFixed(0)}ms`);
+
+    const firstKey = Object.keys(outputs)[0];
+    const first = outputs[firstKey];
+
+    // Debug output shape once
+    if (!self._loggedDims) {
+      console.log(`[weapon-worker] Model Output Dims (${firstKey}):`, first.dims);
+      self._loggedDims = true;
+    }
+
+    self.postMessage(
+      { data: first.data, dims: first.dims },
+      [first.data.buffer]
+    );
   } catch (err) {
     console.error("[weapon-worker] inference error:", err);
     // Post empty result so main thread resets _busy flag and can retry

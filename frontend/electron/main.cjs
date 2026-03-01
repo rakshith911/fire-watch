@@ -275,7 +275,9 @@ async function checkResources() {
   const REQUIRED_FILES = [
     { name: "best.onnx", minSize: 130000000 },           // ~131MB
     { name: "weapons.onnx", minSize: 130000000 },        // ~131MB
-    { name: "depth_anything_v2_small.onnx", minSize: 98000000 } // ~99MB
+    { name: "depth_anything_v2_small.onnx", minSize: 98000000 }, // ~99MB
+    { name: "yolov11n_bestFire.onnx", minSize: 5000000 }, // ~5MB (Estimated for YOLO11n)
+    { name: "weapons_yolo.onnx", minSize: 5000000 }      // ~5MB (Estimated for YOLO11n)
   ];
 
   // Also check for mediamtx binary (ffmpeg is bundled with the app)
@@ -302,7 +304,7 @@ async function checkResources() {
       const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
 
       if (stats.size < file.minSize) {
-        mlog(`⚠️ ${file.name} - CORRUPTED (${sizeMB}MB, expected >${(file.minSize/1024/1024).toFixed(0)}MB)`);
+        mlog(`⚠️ ${file.name} - CORRUPTED (${sizeMB}MB, expected >${(file.minSize / 1024 / 1024).toFixed(0)}MB)`);
         // Delete corrupted file so it gets re-downloaded
         try {
           fs.unlinkSync(filePath);

@@ -50,9 +50,9 @@ export function grabFrameOnce(srcUrl) {
     if (isRtsp) {
       args.push(
         "-rtsp_transport", "tcp",
-        "-timeout", "5000000",
-        "-analyzeduration", "1000000",
-        "-probesize", "1000000"
+        "-timeout", "15000000",
+        "-analyzeduration", "5000000",
+        "-probesize", "10000000"
       );
     }
 
@@ -95,22 +95,22 @@ export function grabMultipleFrames(srcUrl, numFrames = 3) {
     if (isRtsp) {
       args.push(
         "-rtsp_transport", "tcp",
-        "-timeout", "5000000",
-        "-analyzeduration", "1000000",
-        "-probesize", "1000000"
+        "-timeout", "15000000",        // 15s — Amcrest/H.265 cameras are slower to connect
+        "-analyzeduration", "5000000", // 5s — enough for H.265 streams with long GOP intervals
+        "-probesize", "10000000"       // 10MB — H.265 stream headers are much larger than H.264
       );
     }
 
     // Read stream for a few seconds, output 1 frame per second
-    const duration = numFrames + 1; // e.g. 4 seconds for 3 frames
+    // Extra +2s buffer: H.265 cameras with 2s GOP may not deliver first I-frame until ~2s in
+    const duration = numFrames + 2;
     args.push(
       "-i", srcUrl,
       "-t", String(duration),
       "-vf", `fps=1`,
       "-frames:v", String(numFrames),
       "-q:v", "2",
-      "-f", "image2",
-      "-update", "1",
+      "-f", "image2pipe", // image2pipe flushes each JPEG to stdout — image2 -update 1 silently drops frames on non-seekable pipes
       "pipe:1"
     );
 

@@ -169,7 +169,7 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
 
     const numQueries = 300;
     const stride = 6;  // RT-DETR format: [x1, y1, x2, y2, conf, class_id]
-    const probThreshold = 0.35;  // LOW threshold to pass candidates to detectionQueue. Logic there handles strict/consistency checks.
+    const probThreshold = 0.50;  // 50% threshold for weapons
 
     // Verify data length
     const expectedLength = numQueries * stride;

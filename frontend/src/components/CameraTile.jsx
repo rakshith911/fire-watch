@@ -589,6 +589,7 @@ export default function CameraTile({ cam }) {
     let connectionAttempted = false;
 
     async function attachStream() {
+      // ... (stream connection logic remains same) ...
       if (cancelled || connectionAttempted) return;
       connectionAttempted = true;
 
@@ -625,8 +626,8 @@ export default function CameraTile({ cam }) {
       try {
         if (cam.streamType === "WEBRTC") {
           // Use localhost for Electron, LAN IP for browser
-          // const webrtcBase = getMediaMTXUrl(cam.webrtcBase);
-          const webrtcBase = cam.webrtcBase;
+          const webrtcBase = getMediaMTXUrl(cam.webrtcBase);
+          // const webrtcBase = cam.webrtcBase;
           console.log(`[${cam.name}] 🔗 Connecting to WebRTC:`, {
             originalBase: cam.webrtcBase,
             webrtcBase: webrtcBase,
@@ -791,11 +792,22 @@ export default function CameraTile({ cam }) {
         const VideoDetector = await loadVideoDetector();
         if (cancelled) return;
 
+        // Determine correct worker based on AI type
+        const aiType = (cam.aiType || "FIRE").toUpperCase();
+        let selectedWorkerUrl = "../utils/worker-client.js"; // Default Fire
+
+        if (aiType.includes("WEAPON")) {
+          selectedWorkerUrl = "../utils/worker-weapon.js";
+          console.log(`[${cam.name}] Using WEAPON worker: ${selectedWorkerUrl}`);
+        } else {
+          console.log(`[${cam.name}] Using FIRE worker: ${selectedWorkerUrl}`);
+        }
+
         // Don't let VideoDetector create its own video - use existing one
         const d = new VideoDetector({
           id: cam.name,
           mount: null, // Don't mount - we'll attach to existing video
-          workerUrl: "../utils/worker-client.js",
+          workerUrl: selectedWorkerUrl,
           throttleMs: 80,
           onDetections: (boxes) => {
             if (cancelled) return;
@@ -909,8 +921,8 @@ export default function CameraTile({ cam }) {
 
         // Determine which model(s) to run based on camera aiType
         const camAiType = (cam.aiType || "FIRE").toUpperCase();
-        const needsFire = camAiType === "FIRE" || camAiType === "BOTH";
-        const needsWeapon = camAiType === "WEAPON" || camAiType === "BOTH";
+        const needsFire = camAiType.includes("FIRE") || camAiType.includes("BOTH");
+        const needsWeapon = camAiType.includes("WEAPON") || camAiType.includes("BOTH");
 
         console.log(`[${cam.name}] aiType=${camAiType} needsFire=${needsFire} needsWeapon=${needsWeapon}`);
 
@@ -920,7 +932,7 @@ export default function CameraTile({ cam }) {
           // === BOTH mode: two workers running simultaneously ===
           let fireBusy = false, weaponBusy = false;
           let fireBoxes = [], weaponBoxes = [];
-          let boxesDirty = false; // flag to call onDetections only when results arrive
+          let boxesDirty = false;
 
           const fireWorker = new Worker(
             new URL("../utils/worker-client.js", import.meta.url),
@@ -938,15 +950,21 @@ export default function CameraTile({ cam }) {
           };
           fireWorker.onerror = (e) => {
             console.error(`[${cam.name}] Fire worker error:`, e);
+            fireBusy = false;
           };
 
           weaponWorker.onmessage = (evt) => {
-            weaponBoxes = d._processOutputWeapon(evt.data, d._overlay.width, d._overlay.height);
+            const raw = evt.data;
+            const data = raw.data || raw;
+            const dims = raw.dims || null;
+
+            weaponBoxes = d._processOutputWeapon(data, d._overlay.width, d._overlay.height, dims);
             weaponBusy = false;
             boxesDirty = true;
           };
           weaponWorker.onerror = (e) => {
             console.error(`[${cam.name}] Weapon worker error:`, e);
+            weaponBusy = false;
           };
 
           d._worker = fireWorker;
@@ -1028,13 +1046,16 @@ export default function CameraTile({ cam }) {
 
             let firstResponse = true;
             d._worker.onmessage = (evt) => {
-              const output = evt.data;
+              const raw = evt.data;
+              // Weapon worker sends {data, dims}; fire worker sends flat Float32Array
+              const output = raw.data || raw;
+              const dims = raw.dims || null;
               if (firstResponse) {
                 firstResponse = false;
-                console.log(`[${cam.name}] First inference response received — model loaded OK, output length: ${output.length}, canvas: ${d._overlay.width}x${d._overlay.height}`);
+                console.log(`[${cam.name}] First inference response received — model loaded OK, output length: ${output.length}, dims: ${JSON.stringify(dims)}, canvas: ${d._overlay.width}x${d._overlay.height}`);
               }
               d._boxes = needsWeapon
-                ? d._processOutputWeapon(output, d._overlay.width, d._overlay.height)
+                ? d._processOutputWeapon(output, d._overlay.width, d._overlay.height, dims)
                 : d._processOutput(output, d._overlay.width, d._overlay.height);
               d.onDetections(d._boxes);
               d._busy = false;
