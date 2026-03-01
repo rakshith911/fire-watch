@@ -159,6 +159,10 @@ const userDataPath = app.getPath("userData");
 const modelsPath = path.join(userDataPath, "models");
 const backendRootPath = path.join(userDataPath, "backend_bin"); // For binaries like mediamtx
 const versionFilePath = path.join(userDataPath, ".app_version");
+// Frontend YOLO models: served by Vite publicDir in dev, dist/ in production
+const frontendModelsPath = isDev
+  ? path.join(__dirname, "../models")
+  : path.join(__dirname, "../dist");
 ensureDir(modelsPath);
 ensureDir(backendRootPath);
 
@@ -214,7 +218,18 @@ function checkVersionAndClearIfNeeded() {
       mlog("Error clearing models:", e.message);
     }
 
-    // Delete mediamtx binary (ffmpeg is bundled, not downloaded)
+    // Delete frontend YOLO models so they get re-downloaded (production only)
+    if (!isDev) {
+      const yoloModels = ["yolov11n_bestFire.onnx", "weapons_yolo.onnx"];
+      for (const name of yoloModels) {
+        try {
+          const p = path.join(frontendModelsPath, name);
+          if (fs.existsSync(p)) { fs.unlinkSync(p); mlog(`🗑️ Deleted: ${name}`); }
+        } catch (e) { mlog(`Error clearing ${name}:`, e.message); }
+      }
+    }
+
+    // Delete mediamtx binary
     try {
       const binaryName = process.platform === "win32" ? "mediamtx.exe" : "mediamtx";
       const binaryPath = path.join(backendRootPath, binaryName);
@@ -257,12 +272,13 @@ const AWS_REGION = "us-east-1";
 // Create S3 Client (Anonymous if bucket is public, or use embedded Creds - careful!)
 // For the purpose of this demo, we assume the bucket is public-read OR variables are present.
 // If deployment, we should bundle a specific read-only access key.
+const s3CredConfig = process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
+  ? { credentials: { accessKeyId: process.env.AWS_ACCESS_KEY_ID, secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY } }
+  : {};
+
 const s3 = new S3Client({
   region: AWS_REGION,
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID, // Needs to be injected in build or handled
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-  }
+  ...s3CredConfig
 });
 
 mlog("🔍 isDev:", isDev);
@@ -271,11 +287,17 @@ mlog("🔍 UserData Path:", userDataPath);
 
 // ✅ CHECK RESOURCES - with file size validation
 async function checkResources() {
-  // Expected file sizes (in bytes) to validate downloads are complete
-  const REQUIRED_FILES = [
-    { name: "best.onnx", minSize: 130000000 },           // ~131MB
-    { name: "weapons.onnx", minSize: 130000000 },        // ~131MB
-    { name: "depth_anything_v2_small.onnx", minSize: 98000000 } // ~99MB
+  // Backend models (downloaded to userData/models/, used by the Node backend)
+  const BACKEND_MODELS = [
+    { name: "best.onnx", minSize: 130000000, type: "backend_model" },           // ~131MB
+    { name: "weapons.onnx", minSize: 130000000, type: "backend_model" },        // ~131MB
+    { name: "depth_anything_v2_small.onnx", minSize: 98000000, type: "backend_model" } // ~99MB
+  ];
+
+  // Frontend YOLO models (served by Vite/HTTP server, used by in-browser workers)
+  const FRONTEND_MODELS = [
+    { name: "yolov11n_bestFire.onnx", minSize: 9000000, type: "frontend_model" },  // ~10MB
+    { name: "weapons_yolo.onnx", minSize: 11000000, type: "frontend_model" }        // ~12MB
   ];
 
   // Also check for mediamtx binary (ffmpeg is bundled with the app)
@@ -286,35 +308,37 @@ async function checkResources() {
   mlog("═══════════════════════════════════════════════════════════");
   mlog("🔍 CHECKING RESOURCES");
   mlog("═══════════════════════════════════════════════════════════");
-  mlog("Models path:", modelsPath);
+  mlog("Backend models path:", modelsPath);
+  mlog("Frontend models path:", frontendModelsPath);
   mlog("Backend bin path:", backendRootPath);
 
-  // Check models - validate existence AND size
-  for (const file of REQUIRED_FILES) {
-    const filePath = path.join(modelsPath, file.name);
-    const exists = fs.existsSync(filePath);
-
-    if (!exists) {
+  // Helper to check a model file and push to missing if absent/corrupted
+  function checkModelFile(file, dir) {
+    const filePath = path.join(dir, file.name);
+    if (!fs.existsSync(filePath)) {
       mlog(`❌ ${file.name} - MISSING`);
-      missing.push({ type: "model", name: file.name });
-    } else {
-      const stats = fs.statSync(filePath);
-      const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
-
-      if (stats.size < file.minSize) {
-        mlog(`⚠️ ${file.name} - CORRUPTED (${sizeMB}MB, expected >${(file.minSize/1024/1024).toFixed(0)}MB)`);
-        // Delete corrupted file so it gets re-downloaded
-        try {
-          fs.unlinkSync(filePath);
-          mlog(`🗑️ Deleted corrupted ${file.name}`);
-        } catch (e) {
-          mlog(`Failed to delete corrupted file: ${e.message}`);
-        }
-        missing.push({ type: "model", name: file.name });
-      } else {
-        mlog(`✅ ${file.name} - OK (${sizeMB}MB)`);
-      }
+      missing.push({ type: file.type, name: file.name });
+      return;
     }
+    const stats = fs.statSync(filePath);
+    const sizeMB = (stats.size / 1024 / 1024).toFixed(1);
+    if (stats.size < file.minSize) {
+      mlog(`⚠️ ${file.name} - CORRUPTED (${sizeMB}MB, expected >${(file.minSize/1024/1024).toFixed(0)}MB)`);
+      try { fs.unlinkSync(filePath); } catch (e) { mlog(`Failed to delete corrupted file: ${e.message}`); }
+      missing.push({ type: file.type, name: file.name });
+    } else {
+      mlog(`✅ ${file.name} - OK (${sizeMB}MB)`);
+    }
+  }
+
+  // Check backend models
+  for (const file of BACKEND_MODELS) {
+    checkModelFile(file, modelsPath);
+  }
+
+  // Check frontend YOLO models
+  for (const file of FRONTEND_MODELS) {
+    checkModelFile(file, frontendModelsPath);
   }
 
   // Check mediamtx binary
@@ -327,24 +351,31 @@ async function checkResources() {
     mlog(`✅ ${mediamtxName} - OK (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
   }
 
-  // Check ffmpeg - first check bundled location, then app data fallback
+  // Check ffmpeg - check bundled, ffmpeg-static npm, and system PATH (not downloaded from S3)
   const ffmpegName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
   const backendPath = isDev
     ? path.join(__dirname, "../../backend")
     : path.join(process.resourcesPath, "backend");
   const bundledFfmpeg = path.join(backendPath, "bin", ffmpegName);
-  const fallbackFfmpeg = path.join(backendRootPath, ffmpegName);
+  const ffmpegStaticBin = isDev
+    ? path.join(__dirname, "../../backend/node_modules/ffmpeg-static", ffmpegName)
+    : path.join(process.resourcesPath, "backend/node_modules/ffmpeg-static", ffmpegName);
 
   if (fs.existsSync(bundledFfmpeg)) {
-    const stats = fs.statSync(bundledFfmpeg);
-    mlog(`✅ ${ffmpegName} (bundled) - OK (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
-  } else if (fs.existsSync(fallbackFfmpeg)) {
-    const stats = fs.statSync(fallbackFfmpeg);
-    mlog(`✅ ${ffmpegName} (downloaded) - OK (${(stats.size / 1024 / 1024).toFixed(1)}MB)`);
+    mlog(`✅ ${ffmpegName} (bundled) - OK`);
+  } else if (fs.existsSync(ffmpegStaticBin)) {
+    mlog(`✅ ${ffmpegName} (ffmpeg-static) - OK`);
   } else {
-    mlog(`❌ ${ffmpegName} - MISSING (not bundled, will download)`);
-    missing.push({ type: "binary", name: ffmpegName });
+    // Check system ffmpeg as last resort
+    try {
+      const { execSync } = require("child_process");
+      execSync(process.platform === "win32" ? "where ffmpeg" : "which ffmpeg", { stdio: "ignore" });
+      mlog(`✅ ${ffmpegName} (system) - OK`);
+    } catch {
+      mlog(`⚠️ ${ffmpegName} - not found in bundled, ffmpeg-static, or system PATH`);
+    }
   }
+  // ffmpeg is never downloaded from S3 — resolved at runtime via ffmpeg-static or system
 
   mlog("═══════════════════════════════════════════════════════════");
   if (missing.length > 0) {
@@ -367,7 +398,9 @@ async function downloadResources(missingFiles) {
   let current = 0;
 
   for (const file of missingFiles) {
-    const targetDir = file.type === "model" ? modelsPath : backendRootPath;
+    const targetDir = file.type === "backend_model" ? modelsPath
+      : file.type === "frontend_model" ? frontendModelsPath
+      : backendRootPath;
     const targetPath = path.join(targetDir, file.name);
 
     // Update Splash UI
@@ -609,11 +642,15 @@ function startBackend() {
   const serverEntry = path.join(backendSrcPath, "src", "server.js");
   const args = isDev ? ["run", "dev"] : [serverEntry];
 
-  // Resolve ffmpeg: bundled first, then downloaded fallback
+  // Resolve ffmpeg: bundled → ffmpeg-static npm → system
   const ffmpegName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
   const bundledFfmpeg = path.join(backendSrcPath, "bin", ffmpegName);
-  const fallbackFfmpeg = path.join(backendRootPath, ffmpegName);
-  const resolvedFfmpeg = fs.existsSync(bundledFfmpeg) ? bundledFfmpeg : fallbackFfmpeg;
+  const ffmpegStaticBin = isDev
+    ? path.join(__dirname, "../../backend/node_modules/ffmpeg-static", ffmpegName)
+    : path.join(process.resourcesPath, "backend/node_modules/ffmpeg-static", ffmpegName);
+  const resolvedFfmpeg = fs.existsSync(bundledFfmpeg) ? bundledFfmpeg
+    : fs.existsSync(ffmpegStaticBin) ? ffmpegStaticBin
+    : "ffmpeg"; // system fallback
 
   mlog("🔍 Starting backend from:", backendSrcPath);
   mlog("🔍 FFMPEG_BIN:", resolvedFfmpeg, fs.existsSync(resolvedFfmpeg) ? "✅ EXISTS" : "❌ MISSING");
