@@ -49,12 +49,9 @@ export async function sendFireAlert(
     if (typeLower === "knife") {
       emoji = "🔪";
       title = "Knife Detected";
-    } else if (typeLower === "pistol") {
-      emoji = "🔫";
-      title = "Pistol Detected";
     } else if (typeLower === "weapon" || typeLower.includes("weapon")) {
-      emoji = "🔫";
-      title = "Weapon Detected";
+      emoji = "🔪";
+      title = "Knife Detected";
     }
 
     const message = `

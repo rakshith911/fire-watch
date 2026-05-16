@@ -66,10 +66,12 @@ export const cfg = {
 
   port: Number(process.env.PORT || 4000),
   isElectron,
+  backendDetectionEnabled: process.env.BACKEND_DETECTION_ENABLED === "true",
 };
 
 console.log("✅ Config loaded - DynamoDB mode (no local database)");
 console.log("🔥 Fire Endpoint:", cfg.fireEndpoint);
+console.log("🎥 Backend detection auto-start:", cfg.backendDetectionEnabled ? "enabled" : "disabled");
 
 // Validate ffmpeg exists
 if (cfg.ffmpeg !== "ffmpeg") {

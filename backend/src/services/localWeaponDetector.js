@@ -1,10 +1,9 @@
 import * as ort from "onnxruntime-node";
 import sharp from "sharp";
-import { spawn } from "node:child_process";
-import { cfg } from "../config.js";
 import pino from "pino";
 import path from "path";
 import { fileURLToPath } from "url";
+import { grabFrameOnce, grabMultipleFrames } from "./localDetector.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const log = pino({ name: "local-weapon-detector" });
@@ -37,45 +36,6 @@ function getSession() {
         });
     }
     return sessionPromise;
-}
-
-// -------------------------------------------------------------------
-// 🖼️ Frame Extraction via ffmpeg
-// -------------------------------------------------------------------
-function grabFrameOnce(srcUrl) {
-    return new Promise((resolve, reject) => {
-        const isRtsp = srcUrl.startsWith("rtsp://");
-        const args = ["-y"];
-
-        if (isRtsp) {
-            args.push(
-                "-rtsp_transport", "tcp",
-                "-analyzeduration", "1000000",
-                "-probesize", "1000000"
-            );
-        }
-
-        args.push("-i", srcUrl, "-frames:v", "1", "-q:v", "2", "-f", "image2", "-");
-
-        const ff = spawn(cfg.ffmpeg, args, { stdio: ["ignore", "pipe", "pipe"] });
-        const chunks = [];
-        let err = "";
-
-        ff.stdout.on("data", (d) => chunks.push(d));
-        ff.stderr.on("data", (d) => (err += d.toString()));
-        ff.on("error", (spawnError) => {
-            if (spawnError.code === "ENOENT") {
-                log.error({ ffmpegPath: cfg.ffmpeg }, "❌ FFMPEG NOT FOUND");
-                reject(new Error(`ffmpeg not found at: ${cfg.ffmpeg}`));
-            } else {
-                reject(spawnError);
-            }
-        });
-        ff.on("close", (code) => {
-            if (code === 0 && chunks.length) resolve(Buffer.concat(chunks));
-            else reject(new Error(`ffmpeg exit ${code}: ${err.split("\n").slice(-3).join(" ")}`));
-        });
-    });
 }
 
 // -------------------------------------------------------------------
@@ -205,7 +165,7 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
 
     const top5 = allScores.slice(0, 5).map(s => ({
         score: s.score.toFixed(4),
-        label: ["Knife", "Pistol"][s.class] ?? `Unknown(${s.class})`,
+        label: s.class === 0 ? "Knife" : `Ignored(${s.class})`,
         box: s.rawBox  // {cx, cy, w, h} normalized
     }));
     log.info({ top5, letterbox: { scale, padX, padY } }, "🔫 WEAPON: Top 5 Scores (cx,cy,w,h normalized)");
@@ -223,7 +183,7 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
         const classId = Math.round(combined[offset + 5]);
 
         if (confidence < probThreshold) continue;
-        if (classId < 0 || classId > 1) continue;
+        if (classId !== 0) continue; // Only Knife is considered a weapon in this app flow.
 
         // Convert normalized center format to corner format in 640x640 space
         const x1_640 = (cx - w / 2) * 640;
@@ -243,7 +203,7 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
         const x2_clamped = Math.max(0, Math.min(originalWidth, x2));
         const y2_clamped = Math.max(0, Math.min(originalHeight, y2));
 
-        const label = ["Knife", "Pistol"][classId];
+        const label = "Knife";
         boxes.push([x1_clamped, y1_clamped, x2_clamped, y2_clamped, label, confidence]);
     }
 
@@ -264,43 +224,49 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
 // -------------------------------------------------------------------
 // 🔫 Main Weapon Detection Function
 // -------------------------------------------------------------------
+async function analyzeWeaponFrame(jpegBuffer, cameraName, frameLabel = null) {
+    const { tensor, originalWidth, originalHeight, scale, padX, padY } = await prepareInput(jpegBuffer, 640);
+    const outputs = await runInference(tensor);
+
+    // Log output shape for debugging
+    const debugShapes = {};
+    for (const key in outputs) {
+        debugShapes[key] = outputs[key].dims;
+    }
+    log.info({
+        camera: cameraName,
+        frame: frameLabel,
+        outputShapes: debugShapes,
+        originalSize: `${originalWidth}x${originalHeight}`,
+        letterbox: { scale: scale.toFixed(4), padX: padX.toFixed(1), padY: padY.toFixed(1) }
+    }, "🔫 WEAPON: RT-DETR Inference Output");
+
+    const result = processOutput(outputs, originalWidth, originalHeight, scale, padX, padY);
+
+    log.info({
+        camera: cameraName,
+        frame: frameLabel,
+        detected: result.detected,
+        boxCount: result.boxes.length,
+        boxes: result.boxes.map(b => ({
+            label: b[4],
+            confidence: b[5]?.toFixed(3),
+            coords: `[${b[0]?.toFixed(0)},${b[1]?.toFixed(0)},${b[2]?.toFixed(0)},${b[3]?.toFixed(0)}]`,
+        })),
+    }, `🔫 WEAPON: Detection complete — ${result.detected ? 'DETECTED' : 'CLEAR'}`);
+
+    return {
+        isWeapon: result.detected,
+        confidence: result.boxes.length > 0 ? result.boxes[0][5] : 0,
+        boxes: result.boxes,
+        frameBuffer: jpegBuffer,
+    };
+}
+
 export async function detectWeapon(cameraUrl, cameraName) {
     try {
         const jpegBuffer = await grabFrameOnce(cameraUrl);
-        const { tensor, originalWidth, originalHeight, scale, padX, padY } = await prepareInput(jpegBuffer, 640);
-        const outputs = await runInference(tensor);
-
-        // Log output shape for debugging
-        const debugShapes = {};
-        for (const key in outputs) {
-            debugShapes[key] = outputs[key].dims;
-        }
-        log.info({
-            camera: cameraName,
-            outputShapes: debugShapes,
-            originalSize: `${originalWidth}x${originalHeight}`,
-            letterbox: { scale: scale.toFixed(4), padX: padX.toFixed(1), padY: padY.toFixed(1) }
-        }, "🔫 WEAPON: RT-DETR Inference Output");
-
-        const result = processOutput(outputs, originalWidth, originalHeight, scale, padX, padY);
-
-        log.info({
-            camera: cameraName,
-            detected: result.detected,
-            boxCount: result.boxes.length,
-            boxes: result.boxes.map(b => ({
-                label: b[4],
-                confidence: b[5]?.toFixed(3),
-                coords: `[${b[0]?.toFixed(0)},${b[1]?.toFixed(0)},${b[2]?.toFixed(0)},${b[3]?.toFixed(0)}]`,
-            })),
-        }, `🔫 WEAPON: Detection complete — ${result.detected ? 'DETECTED' : 'CLEAR'}`);
-
-        return {
-            isWeapon: result.detected,
-            confidence: result.boxes.length > 0 ? result.boxes[0][5] : 0,
-            boxes: result.boxes,
-            frameBuffer: jpegBuffer,
-        };
+        return await analyzeWeaponFrame(jpegBuffer, cameraName);
     } catch (error) {
         log.error({
             camera: cameraName,
@@ -312,7 +278,37 @@ export async function detectWeapon(cameraUrl, cameraName) {
             confidence: 0,
             boxes: [],
             error: error.message,
+            transientReadError: true,
             frameBuffer: null,
         };
+    }
+}
+
+export async function detectWeaponMultiFrame(cameraUrl, cameraName, numFrames = 3) {
+    try {
+        const jpegBuffers = await grabMultipleFrames(cameraUrl, numFrames);
+        const results = [];
+
+        for (let i = 0; i < jpegBuffers.length; i++) {
+            results.push(await analyzeWeaponFrame(jpegBuffers[i], cameraName, `${i + 1}/${jpegBuffers.length}`));
+        }
+
+        log.info({
+            camera: cameraName,
+            framesExtracted: jpegBuffers.length,
+            framesWithWeapon: results.filter(r => r.isWeapon).length,
+        }, "🔫 WEAPON: Multi-frame detection complete");
+
+        return results;
+    } catch (error) {
+        log.error({ camera: cameraName, error: error.message }, "🔫 WEAPON: Multi-frame detection failed");
+        return [{
+            isWeapon: false,
+            confidence: 0,
+            boxes: [],
+            error: error.message,
+            transientReadError: true,
+            frameBuffer: null,
+        }];
     }
 }

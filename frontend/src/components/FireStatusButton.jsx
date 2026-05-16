@@ -1,6 +1,6 @@
 import React from "react";
 
-const WEAPON_LABELS = ["Knife", "Pistol"];
+const WEAPON_LABELS = ["Knife"];
 
 export default function FireStatusButton({ isFire, alertType }) {
   const isWeapon = alertType && WEAPON_LABELS.includes(alertType);

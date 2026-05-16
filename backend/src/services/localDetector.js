@@ -8,55 +8,66 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const log = pino({ name: "local-detector" });
+const FRAME_READ_RETRIES = 3;
+const FRAME_READ_RETRY_DELAY_MS = 500;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // -------------------------------------------------------------------
 // 🎯 ONNX Session Management (Singleton)
 // -------------------------------------------------------------------
-let sessionPromise = null;
+const sessionPromises = new Map();
 
-function getSession() {
-  if (!sessionPromise) {
+function getSession(modelFile = "best.onnx") {
+  if (!sessionPromises.has(modelFile)) {
     let modelPath;
     if (process.env.MODELS_DIR_OVERRIDE) {
-      modelPath = path.join(process.env.MODELS_DIR_OVERRIDE, "best.onnx");
+      modelPath = path.join(process.env.MODELS_DIR_OVERRIDE, modelFile);
     } else {
-      modelPath = path.resolve(__dirname, "../../models/best.onnx");
+      modelPath = path.resolve(__dirname, "../../models", modelFile);
     }
-    log.info({ modelPath }, "Loading Fire ONNX model...");
+    log.info({ modelPath, modelFile }, "Loading Fire ONNX model...");
 
-    sessionPromise = ort.InferenceSession.create(modelPath, {
+    const sessionPromise = ort.InferenceSession.create(modelPath, {
       executionProviders: ["cpu"],
     }).then((session) => {
-      log.info("✅ Fire ONNX session ready");
+      log.info({ modelFile }, "✅ Fire ONNX session ready");
       log.info({ inputNames: session.inputNames, outputNames: session.outputNames }, "Model Metadata");
       return session;
     }).catch((err) => {
-      log.error({ error: err.message }, "❌ Failed to load Fire ONNX model");
-      sessionPromise = null;
+      log.error({ error: err.message, modelFile }, "❌ Failed to load Fire ONNX model");
+      sessionPromises.delete(modelFile);
       throw err;
     });
+    sessionPromises.set(modelFile, sessionPromise);
   }
-  return sessionPromise;
+  return sessionPromises.get(modelFile);
 }
 
 // -------------------------------------------------------------------
 // 🖼️ Frame Extraction via ffmpeg
 // -------------------------------------------------------------------
-export function grabFrameOnce(srcUrl) {
+function grabFrameOnceAttempt(srcUrl) {
   return new Promise((resolve, reject) => {
     const isRtsp = srcUrl.startsWith("rtsp://");
     const args = ["-y"];
 
     if (isRtsp) {
       args.push(
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
         "-rtsp_transport", "tcp",
+        "-rtsp_flags", "prefer_tcp",
+        "-use_wallclock_as_timestamps", "1",
         "-timeout", "5000000",
-        "-analyzeduration", "1000000",
-        "-probesize", "1000000"
+        "-analyzeduration", "5000000",
+        "-probesize", "5000000"
       );
     }
 
-    args.push("-i", srcUrl, "-frames:v", "1", "-q:v", "2", "-f", "image2", "-");
+    args.push("-i", srcUrl, "-an", "-map", "0:v:0", "-frames:v", "1", "-q:v", "2", "-f", "image2", "-");
 
     log.debug({ ffmpegPath: cfg.ffmpeg, args }, "Spawning ffmpeg");
 
@@ -81,23 +92,42 @@ export function grabFrameOnce(srcUrl) {
   });
 }
 
+export async function grabFrameOnce(srcUrl, retries = FRAME_READ_RETRIES) {
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await grabFrameOnceAttempt(srcUrl);
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) {
+        log.warn({ attempt, retries, error: error.message }, "Single-frame read failed; retrying");
+        await sleep(FRAME_READ_RETRY_DELAY_MS * attempt);
+      }
+    }
+  }
+  throw lastError;
+}
+
 /**
  * Grab multiple frames from a SINGLE ffmpeg connection.
  * This avoids the keyframe/GOP problem where separate connections
  * always start at the same I-frame, producing identical images.
  * Uses fps filter to space frames ~1s apart within a short capture window.
  */
-export function grabMultipleFrames(srcUrl, numFrames = 3) {
+function grabMultipleFramesAttempt(srcUrl, numFrames = 3) {
   return new Promise((resolve, reject) => {
     const isRtsp = srcUrl.startsWith("rtsp://");
     const args = ["-y"];
 
     if (isRtsp) {
       args.push(
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
         "-rtsp_transport", "tcp",
+        "-rtsp_flags", "prefer_tcp",
         "-timeout", "5000000",
-        "-analyzeduration", "1000000",
-        "-probesize", "1000000"
+        "-analyzeduration", "5000000",
+        "-probesize", "5000000"
       );
     }
 
@@ -105,12 +135,13 @@ export function grabMultipleFrames(srcUrl, numFrames = 3) {
     const duration = numFrames + 1; // e.g. 4 seconds for 3 frames
     args.push(
       "-i", srcUrl,
+      "-an",
+      "-map", "0:v:0",
       "-t", String(duration),
       "-vf", `fps=1`,
       "-frames:v", String(numFrames),
       "-q:v", "2",
-      "-f", "image2",
-      "-update", "1",
+      "-f", "image2pipe",
       "pipe:1"
     );
 
@@ -155,10 +186,31 @@ export function grabMultipleFrames(srcUrl, numFrames = 3) {
       // Filter out any tiny/corrupt fragments
       const validFrames = frames.filter(f => f.length > 1000);
 
+      if (validFrames.length === 0) {
+        reject(new Error(`ffmpeg produced no valid JPEG frames: ${err.split("\n").slice(-3).join(" ")}`));
+        return;
+      }
+
       log.info({ requested: numFrames, extracted: validFrames.length }, "📸 Multi-frame extraction complete");
       resolve(validFrames);
     });
   });
+}
+
+export async function grabMultipleFrames(srcUrl, numFrames = 3, retries = FRAME_READ_RETRIES) {
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await grabMultipleFramesAttempt(srcUrl, numFrames);
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) {
+        log.warn({ attempt, retries, error: error.message }, "Multi-frame read failed; retrying");
+        await sleep(FRAME_READ_RETRY_DELAY_MS * attempt);
+      }
+    }
+  }
+  throw lastError;
 }
 
 // -------------------------------------------------------------------
@@ -214,9 +266,9 @@ async function prepareInput(jpegBuffer, modelInputSize = 640) {
 // -------------------------------------------------------------------
 // 🧠 ONNX Inference
 // -------------------------------------------------------------------
-async function runInference(inputTensor) {
+async function runInference(inputTensor, modelFile = "best.onnx") {
   try {
-    const session = await getSession();
+    const session = await getSession(modelFile);
 
     // RT-DETR usually expects [1, 3, 640, 640]
     const tensor = new ort.Tensor(
@@ -265,7 +317,8 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
 
   const numQueries = 300; // Standard RT-DETR query count
   const numClasses = 3; // Fire, Other, Smoke (per model training spec)
-  const probThreshold = 0.5; // Confidence threshold (0.5 recommended for production)
+  const fireProbThreshold = 0.5; // Confidence threshold (0.5 recommended for production)
+  const smokeProbThreshold = 0.7; // Smoke needs higher confidence to reduce haze/steam false positives
 
   // Helper to get box coordinates
   const getBox = (i) => {
@@ -342,8 +395,9 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
   for (let i = 0; i < numQueries; i++) {
     const { maxScore, maxClass } = getScore(i);
 
-    if (maxScore < probThreshold) continue;
     if (maxClass === 1) continue; // Skip "Other" class (index 1) - only care about Fire/Smoke
+    const minScore = maxClass === 2 ? smokeProbThreshold : fireProbThreshold;
+    if (maxScore < minScore) continue;
 
     const [cx, cy, w, h] = getBox(i);
 
@@ -398,11 +452,12 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
 // -------------------------------------------------------------------
 // 🔥 Main Detection Function
 // -------------------------------------------------------------------
-export async function detectFire(cameraUrl, cameraName) {
+export async function detectFire(cameraUrl, cameraName, options = {}) {
   try {
+    const modelFile = options.modelFile || "best.onnx";
     const jpegBuffer = await grabFrameOnce(cameraUrl);
     const { tensor, originalWidth, originalHeight, scale, padX, padY } = await prepareInput(jpegBuffer, 640);
-    const outputs = await runInference(tensor);
+    const outputs = await runInference(tensor, modelFile);
 
     // Log output shape for debugging
     const debugShapes = {};
@@ -411,6 +466,7 @@ export async function detectFire(cameraUrl, cameraName) {
     }
     log.info({
       camera: cameraName,
+      modelFile,
       outputShapes: debugShapes,
       originalSize: `${originalWidth}x${originalHeight}`,
       letterbox: { scale: scale.toFixed(4), padX: padX.toFixed(1), padY: padY.toFixed(1) }
@@ -455,19 +511,21 @@ export async function detectFire(cameraUrl, cameraName) {
  * Solves the keyframe/GOP problem where cameras with long GOP intervals
  * return the same frame on every separate connection.
  */
-export async function detectFireMultiFrame(cameraUrl, cameraName, numFrames = 3) {
+export async function detectFireMultiFrame(cameraUrl, cameraName, numFrames = 3, options = {}) {
   try {
+    const modelFile = options.modelFile || "best.onnx";
     const jpegBuffers = await grabMultipleFrames(cameraUrl, numFrames);
 
     const results = [];
     for (let i = 0; i < jpegBuffers.length; i++) {
       const jpegBuffer = jpegBuffers[i];
       const { tensor, originalWidth, originalHeight, scale, padX, padY } = await prepareInput(jpegBuffer, 640);
-      const outputs = await runInference(tensor);
+      const outputs = await runInference(tensor, modelFile);
       const result = processOutput(outputs, originalWidth, originalHeight, scale, padX, padY);
 
       log.info({
         camera: cameraName,
+        modelFile,
         frame: `${i + 1}/${jpegBuffers.length}`,
         jpegSize: `${(jpegBuffer.length / 1024).toFixed(1)}KB`,
         resolution: `${originalWidth}x${originalHeight}`,
@@ -495,10 +553,15 @@ export async function detectFireMultiFrame(cameraUrl, cameraName, numFrames = 3)
 
     return results;
   } catch (error) {
-    log.error({ camera: cameraName, error: error.message }, "🔥 LOCAL: Multi-frame detection failed, falling back to single-frame");
-    // Fallback: return single frame result
-    const single = await detectFire(cameraUrl, cameraName);
-    return [single];
+    log.error({ camera: cameraName, error: error.message }, "🔥 LOCAL: Multi-frame detection failed");
+    return [{
+      isFire: false,
+      confidence: 0,
+      boxes: [],
+      error: error.message,
+      transientReadError: true,
+      frameBuffer: null,
+    }];
   }
 }
 

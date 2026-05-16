@@ -106,7 +106,9 @@ wss.on("connection", async (ws, req) => {
       if (userCameras.length > 0) {
         log.info(
           { userId, count: userCameras.length },
-          "🎥 Starting detection for new user's cameras"
+          cfg.backendDetectionEnabled
+            ? "🎥 Starting detection for new user's cameras"
+            : "🎥 Backend detection disabled; camera management remains available"
         );
 
         // ✅ Regenerate MediaMTX config for this user
@@ -119,13 +121,15 @@ wss.on("connection", async (ws, req) => {
           log.error({ error: err.message }, "❌ Failed to restart MediaMTX");
         }
 
-        // ✅ Attach userId to each camera before passing to queue
-        const camerasWithUserId = userCameras.map(cam => ({
-          ...cam,
-          userId: userId
-        }));
+        if (cfg.backendDetectionEnabled) {
+          // ✅ Attach userId to each camera before passing to queue
+          const camerasWithUserId = userCameras.map(cam => ({
+            ...cam,
+            userId: userId
+          }));
 
-        await startDetectionQueue(camerasWithUserId);
+          await startDetectionQueue(camerasWithUserId);
+        }
       } else {
         log.warn({ userId }, "⚠️ No cameras found for this user");
       }
@@ -441,7 +445,11 @@ async function main() {
 
   // ✅ NO detection queue at startup - will start when user logs in
   log.info("⏳ Waiting for user to login via WebSocket...");
-  log.info("💡 Cameras and detection will load automatically after authentication");
+  if (cfg.backendDetectionEnabled) {
+    log.info("💡 Cameras and detection will load automatically after authentication");
+  } else {
+    log.info("💡 Backend detection is disabled; camera settings/API stay available after authentication");
+  }
 
   httpServer.listen(cfg.port, () =>
     log.info(`🚀 API & WebSocket listening on port ${cfg.port}`)

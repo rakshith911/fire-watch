@@ -520,6 +520,8 @@ import StreamingIcon from "./StreamingIcon.jsx";
 import FireStatusButton from "./FireStatusButton.jsx";
 import { getMediaMTXUrl } from "../config/electron.js";
 import { sendDetectionEvent } from "../utils/webSocketClient.js";
+import fireWorkerUrl from "../utils/worker-client.js?worker&url";
+import weaponWorkerUrl from "../utils/worker-weapon.js?worker&url";
 
 // We'll lazy-load your ESM VideoDetector class from utils directory
 let VideoDetectorClassPromise;
@@ -539,7 +541,7 @@ export default function CameraTile({ cam }) {
   const [isStreaming, setIsStreaming] = useState(false);
   const [viewed, setViewed] = useState(true);
   const [showSpinner, setShowSpinner] = useState(false);
-  const [alertType, setAlertType] = useState(null); // "Fire", "Knife", "Pistol", etc.
+  const [alertType, setAlertType] = useState(null); // "Fire", "Knife", etc.
   const { updateCameraStatus, showBoundingBoxes } = useCameras();
 
   // Flag to control local detection - set to false to disable local detection. Change to true to enable local detection.
@@ -560,11 +562,30 @@ export default function CameraTile({ cam }) {
 
   // Ref to track bounding box visibility for the animation loop
   const showBoxesRef = useRef(showBoundingBoxes);
+  const backendBoxesRef = useRef(Array.isArray(cam.boxes) ? cam.boxes : []);
 
   useEffect(() => {
     showBoxesRef.current = showBoundingBoxes;
   }, [showBoundingBoxes]);
 
+  useEffect(() => {
+    backendBoxesRef.current = Array.isArray(cam.boxes) ? cam.boxes : [];
+  }, [cam.boxes]);
+
+  const getOverlayBoxes = (localBoxes = []) => {
+    return localBoxes && localBoxes.length > 0 ? localBoxes : backendBoxesRef.current;
+  };
+
+  const logWorkerError = (label, event) => {
+    const detail = {
+      message: event?.message || null,
+      filename: event?.filename || null,
+      lineno: event?.lineno || null,
+      colno: event?.colno || null,
+      error: event?.error?.message || event?.error || null,
+    };
+    console.error(`[${cam.name}] ${label} worker error: ${JSON.stringify(detail)}`);
+  };
 
   // Resolve detection method once (default to LOCAL if missing from DB)
   const detMethod = (cam.detection || "LOCAL").toUpperCase();
@@ -587,6 +608,8 @@ export default function CameraTile({ cam }) {
     let hls;
     let cancelled = false;
     let connectionAttempted = false;
+    let streamReady = false;
+    let retryTimeout = null;
 
     async function attachStream() {
       if (cancelled || connectionAttempted) return;
@@ -625,8 +648,7 @@ export default function CameraTile({ cam }) {
       try {
         if (cam.streamType === "WEBRTC") {
           // Use localhost for Electron, LAN IP for browser
-          // const webrtcBase = getMediaMTXUrl(cam.webrtcBase);
-          const webrtcBase = cam.webrtcBase;
+          const webrtcBase = getMediaMTXUrl(cam.webrtcBase);
           console.log(`[${cam.name}] 🔗 Connecting to WebRTC:`, {
             originalBase: cam.webrtcBase,
             webrtcBase: webrtcBase,
@@ -735,6 +757,7 @@ export default function CameraTile({ cam }) {
               `[${cam.name}] Video playing, readyState: ${v.readyState}`
             );
             if (!cancelled) {
+              streamReady = true;
               setIsStreaming(true);
               updateStatus("Streaming…");
             }
@@ -773,12 +796,20 @@ export default function CameraTile({ cam }) {
           await v.play().catch(() => { });
         }
         if (!cancelled) {
+          streamReady = true;
           setIsStreaming(true);
           updateStatus("Streaming…");
         }
       } catch (err) {
         if (!cancelled) {
           updateStatus(`Failed: ${err?.message || err}`);
+          connectionAttempted = false;
+          if (!streamReady && !retryTimeout) {
+            retryTimeout = setTimeout(() => {
+              retryTimeout = null;
+              attachStream().then(startDetection);
+            }, 3000);
+          }
         }
       }
     }
@@ -804,11 +835,11 @@ export default function CameraTile({ cam }) {
 
             // Determine alert type from box labels
             if (any) {
-              const weaponLabels = ["Knife", "Pistol"];
+              const weaponLabels = ["Knife"];
               const hasWeapon = boxes.some(b => weaponLabels.includes(b[4]));
               const hasFire = boxes.some(b => b[4] === "Fire" || b[4] === "Smoke");
               if (hasWeapon) {
-                // Use the specific weapon label (Knife or Pistol)
+                // Only knife is considered a weapon in this app flow.
                 const topWeapon = boxes.find(b => weaponLabels.includes(b[4]));
                 setAlertType(topWeapon[4]);
               } else if (hasFire) {
@@ -908,7 +939,14 @@ export default function CameraTile({ cam }) {
         detectorRef.current = d;
 
         // Determine which model(s) to run based on camera aiType
-        const camAiType = (cam.aiType || "FIRE").toUpperCase();
+        const rawAiType = (cam.aiType || "FIRE").toUpperCase();
+        const camAiType = rawAiType
+          .replace("FIRE_SMALL", "FIRE")
+          .replace("FIRE_YOLO", "FIRE")
+          .replace("FIRE_DETECTRON", "FIRE")
+          .replace("WEAPON_YOLO", "WEAPON")
+          .replace("WEAPON_DETECTRON", "WEAPON")
+          .replace("BOTH_DETECTRON", "BOTH");
         const needsFire = camAiType === "FIRE" || camAiType === "BOTH";
         const needsWeapon = camAiType === "WEAPON" || camAiType === "BOTH";
 
@@ -923,12 +961,12 @@ export default function CameraTile({ cam }) {
           let boxesDirty = false; // flag to call onDetections only when results arrive
 
           const fireWorker = new Worker(
-            new URL("../utils/worker-client.js", import.meta.url),
-            /* @vite-ignore */ { type: "module", name: `${cam.name}-fire` }
+            fireWorkerUrl,
+            { type: "module", name: `${cam.name}-fire` }
           );
           const weaponWorker = new Worker(
-            new URL("../utils/worker-weapon.js", import.meta.url),
-            /* @vite-ignore */ { type: "module", name: `${cam.name}-weapon` }
+            weaponWorkerUrl,
+            { type: "module", name: `${cam.name}-weapon` }
           );
 
           fireWorker.onmessage = (evt) => {
@@ -937,7 +975,7 @@ export default function CameraTile({ cam }) {
             boxesDirty = true;
           };
           fireWorker.onerror = (e) => {
-            console.error(`[${cam.name}] Fire worker error:`, e);
+            logWorkerError("Fire", e);
           };
 
           weaponWorker.onmessage = (evt) => {
@@ -946,7 +984,7 @@ export default function CameraTile({ cam }) {
             boxesDirty = true;
           };
           weaponWorker.onerror = (e) => {
-            console.error(`[${cam.name}] Weapon worker error:`, e);
+            logWorkerError("Weapon", e);
           };
 
           d._worker = fireWorker;
@@ -966,9 +1004,10 @@ export default function CameraTile({ cam }) {
 
               // Merge boxes from both models and draw
               d._boxes = [...fireBoxes, ...weaponBoxes];
+              const overlayBoxes = getOverlayBoxes(d._boxes);
               d._ctx.clearRect(0, 0, d._overlay.width, d._overlay.height);
               if (showBoxesRef.current) {
-                d._drawBoxes(d._boxes);
+                d._drawBoxes(overlayBoxes);
               }
 
               // Only call onDetections when a worker returned new results
@@ -1018,12 +1057,12 @@ export default function CameraTile({ cam }) {
           // === Single model mode (FIRE or WEAPON) ===
           if (!d._worker) {
             const workerUrl = needsWeapon
-              ? new URL("../utils/worker-weapon.js", import.meta.url)
-              : new URL("../utils/worker-client.js", import.meta.url);
+              ? weaponWorkerUrl
+              : fireWorkerUrl;
 
             d._worker = new Worker(
               workerUrl,
-              /* @vite-ignore */ { type: "module", name: cam.name }
+              { type: "module", name: cam.name }
             );
 
             let firstResponse = true;
@@ -1041,7 +1080,7 @@ export default function CameraTile({ cam }) {
             };
 
             d._worker.onerror = (e) => {
-              console.error(`[${cam.name}] Worker error:`, e);
+              logWorkerError(needsWeapon ? "Weapon" : "Fire", e);
               d._worker = null;
               d._busy = false; // Reset so loop doesn't get stuck
             };
@@ -1069,7 +1108,7 @@ export default function CameraTile({ cam }) {
               d._ctx.clearRect(0, 0, d._overlay.width, d._overlay.height);
 
               if (showBoxesRef.current) {
-                d._drawBoxes(d._boxes);
+                d._drawBoxes(getOverlayBoxes(d._boxes));
               }
 
               if (d._busy) return;
@@ -1143,6 +1182,11 @@ export default function CameraTile({ cam }) {
       if (spinnerTimeoutRef.current) {
         clearTimeout(spinnerTimeoutRef.current);
         spinnerTimeoutRef.current = null;
+      }
+
+      if (retryTimeout) {
+        clearTimeout(retryTimeout);
+        retryTimeout = null;
       }
 
       if (hls) {

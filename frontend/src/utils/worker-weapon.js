@@ -1,5 +1,5 @@
 // frontend/src/utils/worker-weapon.js
-// Web Worker for RT-DETR weapon detection model (Knife/Pistol)
+// Web Worker for weapon detection. Downstream UI only accepts Knife detections.
 import * as ort from "onnxruntime-web";
 
 // Models live in publicDir (models/), served at root.

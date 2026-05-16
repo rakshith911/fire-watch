@@ -174,7 +174,7 @@ export function CamerasProvider({ children }) {
   });
 
   // Global toggle for bounding boxes
-  const [showBoundingBoxes, setShowBoundingBoxes] = useState(false);
+  const [showBoundingBoxes, setShowBoundingBoxes] = useState(true);
 
   // Fetch cameras from API in DB mode
   useEffect(() => {
@@ -415,9 +415,10 @@ export function CamerasProvider({ children }) {
         isStreaming: cameraStatuses[cam.id]?.isStreaming || false,
         isVisible: cameraVisibility[cam.id] !== false, // default to true if not set
         alertType: cameraStatuses[cam.id]?.alertType || null,
+        boxes: cameraStatuses[cam.id]?.boxes || [],
       }));
       console.log(`[Camera Store] 📹 camerasWithStatus recomputed:`,
-        result.map(c => ({ id: c.id, name: c.name, isFire: c.isFire, isStreaming: c.isStreaming }))
+        result.map(c => ({ id: c.id, name: c.name, isFire: c.isFire, isStreaming: c.isStreaming, boxes: c.boxes.length }))
       );
       return result;
     },

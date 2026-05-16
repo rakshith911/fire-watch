@@ -628,9 +628,12 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                                 }
                                 disabled={updatingAiType.has(c.id)}
                               >
-                                <option value="FIRE">🔥 Fire Detect</option>
-                                <option value="WEAPON">🔫 Weapon Detect</option>
-                                <option value="BOTH">🔥🔫 Fire + Weapons</option>
+                                <option value="FIRE">🔥 Fire (Detectron)</option>
+                                <option value="FIRE_SMALL">🔥 Fire-S (Small/Candle)</option>
+                                <option value="FIRE_YOLO">🔥 Fire (YOLO)</option>
+                                <option value="WEAPON">🔫 Weapon (Detectron)</option>
+                                <option value="WEAPON_YOLO">🔫 Weapon (YOLO)</option>
+                                <option value="BOTH">🔥🔫 Fire + Weapon (Detectron)</option>
                               </select>
                             </div>
                           </div>

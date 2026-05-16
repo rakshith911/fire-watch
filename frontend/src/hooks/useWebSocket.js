@@ -16,11 +16,14 @@ export function useWebSocket() {
   const handleFireDetection = useCallback(
     (cameraId, isFire, data = {}) => {
       console.log(`🔥 Fire detection update: Camera ${cameraId}, isFire=${isFire}`);
+      const boxes = Array.isArray(data.boxes) ? data.boxes : [];
 
-      // Update fire status
+      // Update fire status and keep backend boxes so packaged builds can draw
+      // overlays even if the renderer-side model is not producing boxes.
       updateCameraStatus(cameraId, {
         isFire,
         alertType: isFire ? (data.alertType || null) : null,
+        boxes: isFire ? boxes : [],
       });
 
       if (isFire) {
@@ -28,9 +31,12 @@ export function useWebSocket() {
         console.log(`🎥 Auto-showing camera ${cameraId} due to fire detection`);
         autoShownCameras.current.add(cameraId);
         setCameraVisibilityById(cameraId, true);
-      } else if (autoShownCameras.current.has(cameraId)) {
-        // Auto-hide only cameras we auto-showed
-        console.log(`🎥 Auto-hiding camera ${cameraId} — detection cleared`);
+      } else if (
+        (data.reason === "static_fire" || data.reason === "weapon_clear") &&
+        autoShownCameras.current.has(cameraId)
+      ) {
+        // Fire streams stay up on normal clear, but static fire and cleared weapon alerts auto-hide.
+        console.log(`🎥 Auto-hiding camera ${cameraId} — ${data.reason}`);
         autoShownCameras.current.delete(cameraId);
         setCameraVisibilityById(cameraId, false);
       }

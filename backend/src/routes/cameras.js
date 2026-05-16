@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { dynamodb } from "../db/dynamodb.js";
+import { cfg } from "../config.js";
 import {
   addCameraToQueue,
   removeCameraFromQueue,
@@ -14,6 +15,17 @@ import {
 import { startMediaMTX, stopMediaMTX } from "../services/mediamtx.js";
 
 export const cameras = Router();
+
+async function restartMediaMTXForUser(userId, reason) {
+  try {
+    console.log(`🔄 Regenerating MediaMTX config ${reason}...`);
+    await stopMediaMTX();
+    await startMediaMTX(userId);
+    console.log("✅ MediaMTX restarted with updated camera config");
+  } catch (err) {
+    console.error("❌ Failed to restart MediaMTX:", err.message);
+  }
+}
 
 // Create camera
 cameras.post("/", async (req, res) => {
@@ -41,22 +53,15 @@ cameras.post("/", async (req, res) => {
 
     const cam = await dynamodb.createCamera(userId, cameraData);
 
-    try {
-      console.log("🔄 Regenerating MediaMTX config after camera creation...");
-      await stopMediaMTX();
-      await startMediaMTX(userId);
-      console.log("✅ MediaMTX restarted with new camera");
-    } catch (err) {
-      console.error("❌ Failed to restart MediaMTX:", err.message);
-    }
-
-    if (cam.isActive) {
+    if (cfg.backendDetectionEnabled && cam.isActive) {
       cam.userId = userId;
       addCameraToQueue(cam);
       console.log(`✅ Added ${cam.name} to detection queue`);
     }
 
     res.json(cam);
+
+    restartMediaMTXForUser(userId, "after camera creation");
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -151,10 +156,14 @@ cameras.post("/start-detection", async (req, res) => {
       try {
         await dynamodb.updateCamera(userId, cam.id, { isActive: true });
 
-        cam.userId = userId;
-        addCameraToQueue(cam);
+        if (cfg.backendDetectionEnabled) {
+          cam.userId = userId;
+          addCameraToQueue(cam);
+          console.log(`▶️ Started detection for ${cam.name} (id: ${cam.id})`);
+        } else {
+          console.log(`⏸️ Marked ${cam.name} active; backend detection is disabled`);
+        }
         started.push({ id: cam.id, name: cam.name });
-        console.log(`▶️ Started detection for ${cam.name} (id: ${cam.id})`);
       } catch (error) {
         console.error(`❌ Failed to start ${cam.name}:`, error.message);
         failed.push({ id: cam.id, name: cam.name, error: error.message });
@@ -164,7 +173,9 @@ cameras.post("/start-detection", async (req, res) => {
     res.json({
       started,
       failed,
-      message: `Started detection for ${started.length} camera(s)`,
+      message: cfg.backendDetectionEnabled
+        ? `Started detection for ${started.length} camera(s)`
+        : `Marked ${started.length} camera(s) active; backend detection is disabled`,
     });
   } catch (error) {
     console.error("❌ Start detection error:", error);
@@ -249,8 +260,14 @@ cameras.put("/:id", async (req, res) => {
     if (req.body.aiType) {
       const validAiTypes = [
         "FIRE",
+        "FIRE_SMALL",
+        "FIRE_YOLO",
+        "FIRE_DETECTRON",
         "WEAPON",
+        "WEAPON_YOLO",
+        "WEAPON_DETECTRON",
         "BOTH",
+        "BOTH_DETECTRON",
       ];
       if (!validAiTypes.includes(req.body.aiType)) {
         return res.status(400).json({
@@ -263,11 +280,8 @@ cameras.put("/:id", async (req, res) => {
     const currentCam = await dynamodb.getCamera(userId, id);
     const cam = await dynamodb.updateCamera(userId, id, req.body);
 
-    // 🔥 KEY FIX: UPDATE CAMERA INSIDE detectionQueue
-    updateCameraInQueue(id, req.body);
-
     // Handle active → queue behavior
-    if (req.body.isActive !== undefined) {
+    if (cfg.backendDetectionEnabled && req.body.isActive !== undefined) {
       if (req.body.isActive) {
         cam.userId = userId;
         addCameraToQueue(cam);
@@ -276,18 +290,23 @@ cameras.put("/:id", async (req, res) => {
       }
     }
 
-    // If aiType changed and camera is active, restart detection
+    // If aiType changed and camera is active, restart detection with the new model set.
     if (
       req.body.aiType &&
       req.body.aiType !== currentCam.aiType &&
       cam.isActive
     ) {
-      removeCameraFromQueue(cam.id);
-      cam.userId = userId;
-      addCameraToQueue(cam);
-      console.log(
-        `✅ Restarted ${cam.name} - aiType changed from ${currentCam.aiType} to ${cam.aiType}`
-      );
+      if (cfg.backendDetectionEnabled) {
+        removeCameraFromQueue(cam.id);
+        cam.userId = userId;
+        addCameraToQueue(cam);
+        console.log(
+          `✅ Restarted ${cam.name} - aiType changed from ${currentCam.aiType} to ${cam.aiType}`
+        );
+      }
+    } else if (cfg.backendDetectionEnabled && cam.isActive) {
+      // Update non-aiType changes only when the camera is actually active.
+      updateCameraInQueue(id, req.body);
     }
 
     // 🔄 Restart MediaMTX if stream-related fields changed
@@ -296,18 +315,11 @@ cameras.put("/:id", async (req, res) => {
       (field) => req.body[field] !== undefined && req.body[field] !== currentCam[field]
     );
 
-    if (streamFieldChanged) {
-      try {
-        console.log("🔄 Regenerating MediaMTX config after camera update...");
-        await stopMediaMTX();
-        await startMediaMTX(userId);
-        console.log("✅ MediaMTX restarted with updated camera config");
-      } catch (err) {
-        console.error("❌ Failed to restart MediaMTX:", err.message);
-      }
-    }
-
     res.json(cam);
+
+    if (streamFieldChanged) {
+      restartMediaMTXForUser(userId, "after camera update");
+    }
   } catch (error) {
     if (error.message === "Camera not found") {
       return res.status(404).json({ error: "Camera not found" });
@@ -323,7 +335,9 @@ cameras.delete("/:id", async (req, res) => {
     const id = Number(req.params.id);
 
     await dynamodb.getCamera(userId, id);
-    removeCameraFromQueue(id);
+    if (cfg.backendDetectionEnabled) {
+      removeCameraFromQueue(id);
+    }
     await dynamodb.deleteCamera(userId, id);
 
     res.json({ ok: true });

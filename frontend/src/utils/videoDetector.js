@@ -395,7 +395,8 @@ export class VideoDetector {
 
     const cells = 8400; // model-specific
     const clsCount = 3; // Fire/Smoke/Other
-    const probThreshold = 0.2;
+    const fireProbThreshold = 0.2;
+    const smokeProbThreshold = 0.7;
 
     for (let i = 0; i < cells; i++) {
       // pick max-prob class
@@ -408,7 +409,9 @@ export class VideoDetector {
           classId = c;
         }
       }
-      if (best < probThreshold) continue;
+      const label = ["Fire", "Smoke", "Other"][classId];
+      const minScore = label === "Smoke" ? smokeProbThreshold : fireProbThreshold;
+      if (best < minScore) continue;
 
       const xc = output[i];
       const yc = output[cells + i];
@@ -420,7 +423,6 @@ export class VideoDetector {
       const x2 = ((xc + w / 2) / 640) * imgW;
       const y2 = ((yc + h / 2) / 640) * imgH;
 
-      const label = ["Fire", "Smoke", "Other"][classId];
       boxes.push([x1, y1, x2, y2, label, best]);
 
       const area = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
@@ -502,7 +504,7 @@ export class VideoDetector {
     // Same structure as fire model but with weapon classes
     let boxes = [];
     const cells = 8400;
-    const clsCount = 2; // Knife, Pistol
+    const clsCount = 2; // Model outputs Knife/Pistol; app only accepts Knife.
     const probThreshold = 0.55;
     const labels = ["Knife", "Pistol"];
 
@@ -513,6 +515,7 @@ export class VideoDetector {
         const p = output[cells * (c + 4) + i];
         if (p > best) { best = p; classId = c; }
       }
+      if (labels[classId] !== "Knife") continue;
       if (best < probThreshold) continue;
 
       const xc = output[i];
@@ -566,7 +569,6 @@ export class VideoDetector {
       Smoke: "#00FF00",
       Other: "#00FF00",
       Knife: "#FF0000",
-      Pistol: "#FF6600",
     };
 
     boxes.forEach(([x1, y1, x2, y2, label]) => {
