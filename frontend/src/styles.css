@@ -2262,8 +2262,8 @@ body {
 
 .modern-table-header {
   display: grid;
-  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.5fr 0.8fr 1fr 0.8fr;
-  /* Name, Location, IP, Port, Username, Password, StreamPath, View, Stream, Fire, Detection, AI Type, Actions */
+  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.8fr;
+  /* Name, Location, IP, Port, Username, Password, StreamPath, View, Stream, Actions */
   gap: 10px;
   padding: 16px 20px;
   background: transparent;
@@ -2290,8 +2290,8 @@ body {
 
 .modern-table-row {
   display: grid;
-  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.5fr 0.8fr 1fr 0.8fr;
-  /* Name, Location, IP, Port, Username, Password, StreamPath, View, Stream, Fire, Detection, AI Type, Actions */
+  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.8fr;
+  /* Name, Location, IP, Port, Username, Password, StreamPath, View, Stream, Actions */
   gap: 10px;
   padding: 18px 20px;
   background: var(--surface-2);
@@ -3428,45 +3428,6 @@ body {
   animation: pulse 1.5s ease-in-out infinite;
 }
 
-/* AI Type dropdown styles */
-.aitype-select-wrapper {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.aitype-select {
-  padding: 6px 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  background: var(--bg-secondary);
-  color: var(--text-primary);
-  cursor: pointer;
-  font-size: 13px;
-  transition: all 0.2s;
-  width: 100%;
-  font-family: inherit;
-}
-
-.aitype-select:hover:not(:disabled) {
-  background: var(--bg-hover);
-  border-color: var(--accent-color);
-}
-
-.aitype-select:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-.aitype-select:focus {
-  outline: none;
-  border-color: var(--accent-color);
-  box-shadow: 0 0 0 2px rgba(74, 144, 226, 0.2);
-}
-
-.aitype-select.updating {
-  animation: pulse 1.5s ease-in-out infinite;
-}
 
 /* ==========================================================================
      TOGGLE SWITCH
@@ -3554,4 +3515,167 @@ input:checked+.slider:before {
   color: var(--ui-text-slate);
   user-select: none;
   cursor: pointer;
+}
+/* ==========================================================================
+   THREAT TIMELINE  (EPIC-Kitchens style)
+   ========================================================================== */
+
+.threat-timeline {
+  position: relative;
+  width: 100%;
+  background: var(--surface, #1e1e2e);
+  border-top: 1px solid var(--border, #44475a);
+  padding: 8px 0 20px 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+.tt-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 0 0 90px;
+  position: relative;
+}
+
+.tt-row {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  position: relative;
+}
+
+.tt-row-label {
+  position: absolute;
+  left: -90px;
+  width: 86px;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--muted, #6272a4);
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.tt-track {
+  position: relative;
+  flex: 1;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.tt-segment {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-radius: 3px;
+  min-width: 3px;
+  opacity: 0.88;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  transition: opacity 0.2s;
+}
+
+.tt-segment:hover {
+  opacity: 1;
+  z-index: 2;
+}
+
+.tt-segment--live {
+  animation: tt-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes tt-pulse {
+  0%, 100% { opacity: 0.88; }
+  50%       { opacity: 1; }
+}
+
+.tt-seg-label {
+  padding: 0 5px;
+  font-size: 9px;
+  font-weight: 700;
+  color: rgba(0, 0, 0, 0.85);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  letter-spacing: 0.02em;
+}
+
+/* Time axis */
+.tt-axis {
+  position: absolute;
+  bottom: 2px;
+  left: 90px;
+  right: 0;
+  height: 14px;
+}
+
+.tt-tick {
+  position: absolute;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.tt-tick-line {
+  width: 1px;
+  height: 4px;
+  background: var(--border, #44475a);
+}
+
+.tt-tick-label {
+  font-size: 9px;
+  color: var(--muted, #6272a4);
+  white-space: nowrap;
+  margin-top: 1px;
+}
+
+/* Light theme overrides */
+[data-theme="light"] .threat-timeline {
+  background: var(--surface, #f5f5f5);
+  border-top-color: var(--border, #e0e0e0);
+}
+
+[data-theme="light"] .tt-track {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+[data-theme="light"] .tt-seg-label {
+  color: rgba(255, 255, 255, 0.92);
+}
+
+/* ==========================================================================
+   DETECTION LABEL OVERLAY  (EPIC-Kitchens style — bottom-left of video)
+   ========================================================================== */
+
+.detection-label {
+  position: absolute;
+  bottom: 40px; /* sit above the video controls bar */
+  left: 12px;
+  padding: 4px 10px 4px 8px;
+  border-left: 3px solid currentColor;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(4px);
+  border-radius: 0 4px 4px 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  pointer-events: none;
+  z-index: 10;
+  animation: label-fadein 0.25s ease;
+}
+
+@keyframes label-fadein {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
 }

@@ -270,6 +270,38 @@ class LivenessValidator {
             return 0; // Return 0 ratio on error
         }
     }
+
+    /**
+     * Compare two frames across detection cycles to detect inter-cycle scene change.
+     * Used to distinguish a static photo (zero change) from real fire (scene changes every few seconds).
+     * Returns ratio of pixels that changed significantly (threshold 30/255).
+     */
+    async compareInterCycle(buf1, buf2, box) {
+        if (!buf1 || !buf2) return 0;
+        try {
+            const x1 = Math.max(0, Math.floor(box[0]));
+            const y1 = Math.max(0, Math.floor(box[1]));
+            const width  = Math.max(1, Math.floor(box[2] - box[0]));
+            const height = Math.max(1, Math.floor(box[3] - box[1]));
+
+            const [crop1, crop2] = await Promise.all([
+                sharp(buf1).extract({ left: x1, top: y1, width, height }).greyscale().resize(100, 100, { fit: "fill" }).raw().toBuffer(),
+                sharp(buf2).extract({ left: x1, top: y1, width, height }).greyscale().resize(100, 100, { fit: "fill" }).raw().toBuffer(),
+            ]);
+
+            let changed = 0;
+            const total = crop1.length;
+            for (let i = 0; i < total; i++) {
+                if (Math.abs(crop1[i] - crop2[i]) > 30) changed++;
+            }
+            const ratio = changed / total;
+            console.log(`[Liveness] Inter-cycle diff: ratio=${ratio.toFixed(5)} (${changed}/${total} pixels)`);
+            return ratio;
+        } catch (err) {
+            console.error("[Liveness] Inter-cycle compare error:", err);
+            return 0;
+        }
+    }
 }
 
 export default new LivenessValidator();

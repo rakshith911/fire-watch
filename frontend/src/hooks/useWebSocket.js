@@ -3,57 +3,57 @@ import { useEffect, useCallback, useRef } from "react";
 import { initWebSocket, closeWebSocket } from "../utils/webSocketClient.js";
 import { useCameras } from "../store/cameras.jsx";
 
-/**
- * Custom hook to manage WebSocket connection for fire detection alerts.
- * Automatically shows cameras and starts streams when fire is detected.
- */
 export function useWebSocket() {
-  const { updateCameraStatus, setCameraVisibilityById } = useCameras();
+  const { updateCameraStatus, setCameraVisibilityById, pushDetectionEvent } = useCameras();
   const isInitialized = useRef(false);
-  // Track cameras that were auto-shown by detection so we only auto-hide those
-  const autoShownCameras = useRef(new Set());
 
   const handleFireDetection = useCallback(
     (cameraId, isFire, data = {}) => {
-      console.log(`🔥 Fire detection update: Camera ${cameraId}, isFire=${isFire}`);
       const boxes = Array.isArray(data.boxes) ? data.boxes : [];
+      const event = data.event || null;
+      const isBehavioral = data.isBehavioral || false;
+      const reason = data.reason || null;
 
-      // Update fire status and keep backend boxes so packaged builds can draw
-      // overlays even if the renderer-side model is not producing boxes.
-      updateCameraStatus(cameraId, {
+      // "person_left" / "weapon_gone" clear label + boxes, don't touch fire state
+      if (reason === "person_left" || reason === "weapon_gone") {
+        updateCameraStatus(cameraId, { persistentLabel: null, boxes: [] });
+        return;
+      }
+
+      // Build status update — isFire and boxes always update
+      const statusUpdate = {
         isFire,
-        alertType: isFire ? (data.alertType || null) : null,
         boxes: isFire ? boxes : [],
-      });
+        alertType: isFire ? (data.alertType || null) : null,
+      };
 
-      if (isFire) {
-        // Auto-show camera and track that we opened it
-        console.log(`🎥 Auto-showing camera ${cameraId} due to fire detection`);
-        autoShownCameras.current.add(cameraId);
+      // persistentLabel only updates on explicit events or behavioral detections.
+      // Repeat fire cycles (event=null) don't overwrite "Fire Started" with "Fire".
+      if (event) {
+        statusUpdate.persistentLabel = event;
+      } else if (isBehavioral && data.clipLabel) {
+        statusUpdate.persistentLabel = data.clipLabel;
+      } else if (!isFire) {
+        // Fire cleared — wipe label too
+        statusUpdate.persistentLabel = null;
+      }
+
+      updateCameraStatus(cameraId, statusUpdate);
+      pushDetectionEvent(cameraId, isFire, data);
+
+      if (isFire || event) {
         setCameraVisibilityById(cameraId, true);
-      } else if (
-        (data.reason === "static_fire" || data.reason === "weapon_clear") &&
-        autoShownCameras.current.has(cameraId)
-      ) {
-        // Fire streams stay up on normal clear, but static fire and cleared weapon alerts auto-hide.
-        console.log(`🎥 Auto-hiding camera ${cameraId} — ${data.reason}`);
-        autoShownCameras.current.delete(cameraId);
-        setCameraVisibilityById(cameraId, false);
       }
     },
-    [updateCameraStatus, setCameraVisibilityById]
+    [updateCameraStatus, setCameraVisibilityById, pushDetectionEvent]
   );
 
   useEffect(() => {
-    // Prevent multiple initializations
     if (isInitialized.current) return;
-
-    console.log("🔌 Initializing WebSocket connection...");
     isInitialized.current = true;
     initWebSocket(handleFireDetection);
 
     return () => {
-      console.log("🔌 Cleaning up WebSocket connection...");
       closeWebSocket();
       isInitialized.current = false;
     };

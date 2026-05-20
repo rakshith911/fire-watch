@@ -1,7 +1,6 @@
 import React, { useState, useMemo } from "react";
 import { useCameras } from "../store/cameras.jsx";
 import StreamingIcon from "../components/StreamingIcon.jsx";
-import FireStatusButton from "../components/FireStatusButton.jsx";
 import AddCameraDialog from "../components/AddCameraDialog.jsx";
 import { version as appVersion } from "../../package.json";
 import {
@@ -15,7 +14,6 @@ import {
   FaLock,
   FaUnlock,
 } from "react-icons/fa";
-import { ImFire } from "react-icons/im";
 import { useAuth } from "../auth/AuthContext.jsx";
 import { toggleTheme } from "../utils/theme.js";
 import { cameraApi } from "../services/cameraApi.js";
@@ -46,8 +44,6 @@ export default function Status({ onNavigate, currentPage = "status" }) {
   const [animatingOutIds, setAnimatingOutIds] = useState(new Set());
   const [searchQuery, setSearchQuery] = useState("");
   const [filter, setFilter] = useState("all");
-  const [togglingDetection, setTogglingDetection] = useState(new Set());
-  const [updatingAiType, setUpdatingAiType] = useState(new Set());
   const [samplingRate, setSamplingRate] = useState(30000); // Default 30 seconds
   const [updatingSamplingRate, setUpdatingSamplingRate] = useState(false);
 
@@ -127,39 +123,7 @@ export default function Status({ onNavigate, currentPage = "status" }) {
     }
   };
 
-  const handleDetectionChange = async (cameraId, newDetection) => {
-    setTogglingDetection((prev) => new Set([...prev, cameraId]));
-    try {
-      await updateCamera(cameraId, { detection: newDetection });
-      await fetchCamerasFromDB();
-    } catch (error) {
-      console.error("Failed to update detection: ", error);
-      alert(`Failed to update detection: ${error.message}`);
-    } finally {
-      setTogglingDetection((prev) => {
-        const newSet = new Set(prev);
-        newSet.delete(cameraId);
-        return newSet;
-      });
-    }
-  };
 
-  const handleAiTypeChange = async (cameraId, newAiType) => {
-    setUpdatingAiType((prev) => new Set([...prev, cameraId]));
-    try {
-      await updateCamera(cameraId, { aiType: newAiType });
-      await fetchCamerasFromDB();
-    } catch (error) {
-      console.error("Failed to update AI type: ", error);
-      alert(`Failed to update AI type: ${error.message}`);
-    } finally {
-      setUpdatingAiType((prev) => {
-        const newSet = new Set(prev);
-        newSet.delete(cameraId);
-        return newSet;
-      });
-    }
-  };
 
   // Filter and search cameras
   const visibleCameras = useMemo(() => {
@@ -424,9 +388,6 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                     <div className="header-cell streampath-col">Stream Path</div>
                     <div className="header-cell view-col">View</div>
                     <div className="header-cell stream-col">Stream</div>
-                    <div className="header-cell fire-col">Fire</div>
-                    <div className="header-cell detection-col">Detection</div>
-                    <div className="header-cell aitype-col">AI Type</div>
                     <div className="header-cell actions-col">Actions</div>
                   </div>
                   <div className="modern-table-body">
@@ -578,64 +539,6 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                               isStreaming={c.isStreaming}
                               size={28}
                             />
-                          </div>
-                          <div className="table-cell fire-col">
-                            <span className="cell-label">Fire</span>
-                            {c.isFire ? (
-                              <ImFire
-                                size={42}
-                                style={{
-                                  color: "#ff0000",
-                                  filter: "drop-shadow(0 0 0 1px #ff6600)",
-                                }}
-                              />
-                            ) : (
-                              <FireStatusButton isFire={false} />
-                            )}
-                          </div>
-                          <div className="table-cell detection-col">
-                            <span className="cell-label">Detection</span>
-                            <div className="detection-select-wrapper">
-                              <select
-                                className={`detection-select ${(
-                                  c.detection || "LOCAL"
-                                ).toLowerCase()} ${togglingDetection.has(c.id) ? "updating" : ""
-                                  }`}
-                                value={c.detection || "LOCAL"}
-                                onChange={(e) =>
-                                  handleDetectionChange(c.id, e.target.value)
-                                }
-                                disabled={togglingDetection.has(c.id)}
-                              >
-                                <option value="LOCAL">💻 Local</option>
-                                <option value="CLOUD">☁️ Cloud</option>
-                                <option value="BOTH">🔄 Both</option>
-                              </select>
-                              {togglingDetection.has(c.id) && (
-                                <span className="detection-updating">⏳</span>
-                              )}
-                            </div>
-                          </div>
-                          <div className="table-cell aitype-col">
-                            <span className="cell-label">AI Type</span>
-                            <div className="aitype-select-wrapper">
-                              <select
-                                className={`aitype-select ${updatingAiType.has(c.id) ? "updating" : ""
-                                  }`}
-                                value={c.aiType || "FIRE"}
-                                onChange={(e) =>
-                                  handleAiTypeChange(c.id, e.target.value)
-                                }
-                                disabled={updatingAiType.has(c.id)}
-                              >
-                                <option value="FIRE">🔥 Fire (Detectron)</option>
-                                <option value="FIRE_SMALL">🔥 Fire-S (Small/Candle)</option>
-                                <option value="FIRE_YOLO">🔥 Fire (YOLO)</option>
-                                <option value="WEAPON">🔫 Weapon (Detectron)</option>
-                                <option value="WEAPON_YOLO">🔫 Weapon (YOLO)</option>
-                                <option value="BOTH">🔥🔫 Fire + Weapon (Detectron)</option>
-                              </select>
-                            </div>
                           </div>
                           <div className="table-cell actions-col">
                             <span className="cell-label">Actions</span>

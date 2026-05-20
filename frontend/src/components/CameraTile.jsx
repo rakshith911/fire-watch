@@ -6,6 +6,7 @@
 // import { useCameras } from "../store/cameras.jsx";
 // import StreamingIcon from "./StreamingIcon.jsx";
 // import FireStatusButton from "./FireStatusButton.jsx";
+// import ThreatTimeline from "./ThreatTimeline.jsx";
 
 // // We'll lazy-load your ESM VideoDetector class from utils directory
 // let VideoDetectorClassPromise;
@@ -510,14 +511,13 @@
 //   );
 // }
 
-import React, { useEffect, useRef, useState, useMemo } from "react";
+import React, { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import Hls from "hls.js";
 import { FaSpinner, FaExclamationCircle } from "react-icons/fa";
 import { startCloudDetect, stopCloudDetect } from "../utils/cloudDetect.js";
 import { playWebRTC } from "../utils/playWebRTC.js";
 import { useCameras } from "../store/cameras.jsx";
 import StreamingIcon from "./StreamingIcon.jsx";
-import FireStatusButton from "./FireStatusButton.jsx";
 import { getMediaMTXUrl } from "../config/electron.js";
 import { sendDetectionEvent } from "../utils/webSocketClient.js";
 import fireWorkerUrl from "../utils/worker-client.js?worker&url";
@@ -544,7 +544,8 @@ export default function CameraTile({ cam }) {
   const [alertType, setAlertType] = useState(null); // "Fire", "Knife", etc.
   const { updateCameraStatus, showBoundingBoxes } = useCameras();
 
-  // Flag to control local detection - set to false to disable local detection. Change to true to enable local detection.
+  // Run both fire + weapon YOLO in-browser for real-time bounding boxes.
+  // Backend still does CLIP/V-JEPA verification for labels and alerts.
   const isStartLocalDetection = true;
 
   // keep detector instance for local mode
@@ -563,6 +564,8 @@ export default function CameraTile({ cam }) {
   // Ref to track bounding box visibility for the animation loop
   const showBoxesRef = useRef(showBoundingBoxes);
   const backendBoxesRef = useRef(Array.isArray(cam.boxes) ? cam.boxes : []);
+  const backendCanvasRef = useRef(null);
+  const boxClearTimerRef = useRef(null);
 
   useEffect(() => {
     showBoxesRef.current = showBoundingBoxes;
@@ -576,6 +579,114 @@ export default function CameraTile({ cam }) {
     return localBoxes && localBoxes.length > 0 ? localBoxes : backendBoxesRef.current;
   };
 
+  // Sync the backend canvas to the actual rendered video content area (letterbox-aware)
+  const syncBackendCanvas = useCallback(() => {
+    const canvas = backendCanvasRef.current;
+    const v = videoRef.current;
+    if (!canvas || !v || !v.videoWidth || !v.videoHeight) return;
+
+    canvas.width  = v.videoWidth;
+    canvas.height = v.videoHeight;
+
+    const elemRect   = v.getBoundingClientRect();
+    const parentRect = v.parentElement?.getBoundingClientRect();
+    if (!parentRect) return;
+
+    const videoRatio = v.videoWidth / v.videoHeight;
+    const elemRatio  = elemRect.width / elemRect.height;
+    let contentW, contentH, offsetX, offsetY;
+    if (videoRatio > elemRatio) {
+      contentW = elemRect.width;
+      contentH = elemRect.width / videoRatio;
+      offsetX  = 0;
+      offsetY  = (elemRect.height - contentH) / 2;
+    } else {
+      contentH = elemRect.height;
+      contentW = elemRect.height * videoRatio;
+      offsetX  = (elemRect.width - contentW) / 2;
+      offsetY  = 0;
+    }
+
+    canvas.style.width  = `${contentW}px`;
+    canvas.style.height = `${contentH}px`;
+    canvas.style.left   = `${elemRect.left - parentRect.left + offsetX}px`;
+    canvas.style.top    = `${elemRect.top  - parentRect.top  + offsetY}px`;
+  }, []);
+
+  // Attach resize/play listeners so canvas stays aligned when video layout changes
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.addEventListener("loadedmetadata", syncBackendCanvas);
+    v.addEventListener("resize",         syncBackendCanvas);
+    v.addEventListener("play",           syncBackendCanvas);
+    const ro = new ResizeObserver(syncBackendCanvas);
+    ro.observe(v);
+    return () => {
+      v.removeEventListener("loadedmetadata", syncBackendCanvas);
+      v.removeEventListener("resize",         syncBackendCanvas);
+      v.removeEventListener("play",           syncBackendCanvas);
+      ro.disconnect();
+    };
+  }, [syncBackendCanvas]);
+
+  // Draw backend boxes whenever boxes or visibility toggle changes
+  useEffect(() => {
+    const canvas = backendCanvasRef.current;
+    if (!canvas) return;
+    syncBackendCanvas();
+    const ctx = canvas.getContext("2d");
+
+    const drawBoxes = (boxes) => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!showBoundingBoxes || !boxes?.length) return;
+      for (const box of boxes) {
+        const [x1, y1, x2, y2, label, conf] = box;
+        const lbl = String(label || "");
+        let color = "#f97316";
+        if (lbl.toLowerCase().includes("smoke"))   color = "#ffb86c";
+        else if (lbl.toLowerCase() === "fire")     color = "#ef4444";
+
+        const bw = 3;
+        ctx.strokeStyle = color;
+        ctx.lineWidth   = bw;
+        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+        const text = `${lbl} ${conf != null ? `${(conf * 100).toFixed(0)}%` : ""}`.trim();
+        const fontSize = Math.max(14, Math.round(canvas.height / 50));
+        ctx.font = `bold ${fontSize}px sans-serif`;
+        const textW = ctx.measureText(text).width;
+        ctx.fillStyle = color;
+        ctx.fillRect(x1, y1 - fontSize - 6, textW + 8, fontSize + 6);
+        ctx.fillStyle = "#000";
+        ctx.fillText(text, x1 + 4, y1 - 4);
+      }
+    };
+
+    // Cancel any pending auto-clear
+    if (boxClearTimerRef.current) {
+      clearTimeout(boxClearTimerRef.current);
+      boxClearTimerRef.current = null;
+    }
+
+    drawBoxes(cam.boxes);
+
+    // Auto-clear stale boxes after 8 s if no new update arrives
+    if (cam.boxes?.length) {
+      boxClearTimerRef.current = setTimeout(() => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        boxClearTimerRef.current = null;
+      }, 8000);
+    }
+
+    return () => {
+      if (boxClearTimerRef.current) {
+        clearTimeout(boxClearTimerRef.current);
+        boxClearTimerRef.current = null;
+      }
+    };
+  }, [cam.boxes, showBoundingBoxes, syncBackendCanvas]);
+
   const logWorkerError = (label, event) => {
     const detail = {
       message: event?.message || null,
@@ -587,21 +698,15 @@ export default function CameraTile({ cam }) {
     console.error(`[${cam.name}] ${label} worker error: ${JSON.stringify(detail)}`);
   };
 
-  // Resolve detection method once (default to LOCAL if missing from DB)
-  const detMethod = (cam.detection || "LOCAL").toUpperCase();
-  const isLocalDetection = detMethod === "LOCAL" || detMethod === "BOTH";
-
   // Update camera status in store whenever local state changes
   useEffect(() => {
     const updates = { isStreaming };
-
-    if (isStartLocalDetection && isLocalDetection) {
-      updates.isFire = isFire;
+    if (isStartLocalDetection) {
+      updates.isFire    = isFire;
       updates.alertType = alertType;
     }
-
     updateCameraStatus(cam.id, updates);
-  }, [isFire, isStreaming, alertType, cam.id, isLocalDetection, updateCameraStatus]);
+  }, [isFire, isStreaming, alertType, cam.id, updateCameraStatus]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -728,7 +833,7 @@ export default function CameraTile({ cam }) {
             v.addEventListener("canplay", checkAndResolve);
             v.addEventListener("canplaythrough", checkAndResolve);
 
-            // Timeout after 5 seconds
+            // Timeout after 15 seconds — WebRTC streams can take longer on first connect
             setTimeout(() => {
               if (!resolved) {
                 console.warn(
@@ -738,7 +843,7 @@ export default function CameraTile({ cam }) {
                 cleanup();
                 resolve(false);
               }
-            }, 5000);
+            }, 15000);
 
             // Check immediately in case already ready
             if (v.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
@@ -817,56 +922,26 @@ export default function CameraTile({ cam }) {
     // detection wiring
     async function startDetection() {
       if (cancelled) return;
-      if (isStartLocalDetection && isLocalDetection) {
-        console.log(`[${cam.name}] Starting local detection...`);
+      if (isStartLocalDetection) {
+        console.log(`[${cam.name}] Starting local detection (fire + weapon)...`);
         const VideoDetector = await loadVideoDetector();
         if (cancelled) return;
 
-        // Don't let VideoDetector create its own video - use existing one
         const d = new VideoDetector({
           id: cam.name,
-          mount: null, // Don't mount - we'll attach to existing video
+          mount: null,
           workerUrl: "../utils/worker-client.js",
           throttleMs: 80,
           onDetections: (boxes) => {
             if (cancelled) return;
             const any = boxes && boxes.length > 0;
             setIsFire(any);
-
-            // Determine alert type from box labels
             if (any) {
-              const weaponLabels = ["Knife"];
-              const hasWeapon = boxes.some(b => weaponLabels.includes(b[4]));
-              const hasFire = boxes.some(b => b[4] === "Fire" || b[4] === "Smoke");
-              if (hasWeapon) {
-                // Only knife is considered a weapon in this app flow.
-                const topWeapon = boxes.find(b => weaponLabels.includes(b[4]));
-                setAlertType(topWeapon[4]);
-              } else if (hasFire) {
-                setAlertType("Fire");
-              }
+              const topWeapon = boxes.find(b => b[4] === "Knife");
+              const hasFire   = boxes.some(b => b[4] === "Fire" || b[4] === "Smoke");
+              setAlertType(topWeapon ? topWeapon[4] : hasFire ? "Fire" : null);
             } else {
               setAlertType(null);
-            }
-
-            // Send high-confidence detections to backend (debounced 5s)
-            if (any) {
-              const highConfBoxes = boxes.filter((b) => b[5] >= 0.5);
-              const now = Date.now();
-              if (highConfBoxes.length > 0 && now - lastDetectionSentRef.current > 5000) {
-                lastDetectionSentRef.current = now;
-                console.log(`[${cam.name}] Sending frontend detection to backend:`, {
-                  boxCount: highConfBoxes.length,
-                  labels: highConfBoxes.map(b => `${b[4]}(${b[5]?.toFixed(2)})`),
-                });
-                sendDetectionEvent({
-                  type: "frontend-detection",
-                  cameraId: cam.id,
-                  cameraName: cam.name,
-                  boxes: highConfBoxes,
-                  timestamp: new Date().toISOString(),
-                });
-              }
             }
           },
         });
@@ -938,19 +1013,9 @@ export default function CameraTile({ cam }) {
 
         detectorRef.current = d;
 
-        // Determine which model(s) to run based on camera aiType
-        const rawAiType = (cam.aiType || "FIRE").toUpperCase();
-        const camAiType = rawAiType
-          .replace("FIRE_SMALL", "FIRE")
-          .replace("FIRE_YOLO", "FIRE")
-          .replace("FIRE_DETECTRON", "FIRE")
-          .replace("WEAPON_YOLO", "WEAPON")
-          .replace("WEAPON_DETECTRON", "WEAPON")
-          .replace("BOTH_DETECTRON", "BOTH");
-        const needsFire = camAiType === "FIRE" || camAiType === "BOTH";
-        const needsWeapon = camAiType === "WEAPON" || camAiType === "BOTH";
-
-        console.log(`[${cam.name}] aiType=${camAiType} needsFire=${needsFire} needsWeapon=${needsWeapon}`);
+        // Always run both fire and weapon workers — real-time boxes for everything.
+        const needsFire   = true;
+        const needsWeapon = true;
 
         // Start the detector (spawn worker(s) and bind video loop)
         // DON'T call attachWebRTC or start() since we're manually managing video/canvas
@@ -1256,8 +1321,30 @@ export default function CameraTile({ cam }) {
   ]);
 
   const displayFireStatus = cam.isFire || isFire;
-  // Determine which alert type to display — local detection takes priority, then backend
-  const displayAlertType = alertType || cam.alertType || (displayFireStatus ? "Fire" : null);
+
+  // All labels now come from CLIP directly — no hardcoded mappings needed.
+  // Fire-started: "Active fire detected in the scene" (from CLIP verify)
+  // Fire-clear: CLIP describes why ("Camera moved away from the fire source", etc.)
+  // Behavioral: CLIP sentence labels ("Someone carrying a knife...", etc.)
+  const rawLabel = cam.persistentLabel || (displayFireStatus ? (alertType || cam.alertType) : null);
+  const displayLabel = rawLabel || null;
+
+  // Map label to CSS colour
+  const detectionLabelColor = (() => {
+    if (!displayLabel) return null;
+    const t = displayLabel.toLowerCase();
+    if (t.includes("smoke"))                                        return "#ffb86c";
+    if (t.includes("no longer") || t.includes("cleared"))          return "#50fa7b";
+    if (t.includes("fire") || t.includes("active fire"))           return "#f97316";
+    if (t.includes("threat"))                                       return "#ff5555";
+    if (t.includes("weapon") || t.includes("knife") || t.includes("bladed")) return "#8be9fd";
+    if (t.includes("mask") || t.includes("face") || t.includes("balaclava")) return "#bd93f9";
+    if (t.includes("suspicious"))                                   return "#ff79c6";
+    if (t.includes("dancing") || t.includes("rhythmic"))           return "#8be9fd";
+    if (t.includes("entering") || t.includes("entry"))             return "#ffb86c";
+    if (t.includes("loiter"))                                       return "#8be9fd";
+    return "#f97316";
+  })();
 
   return (
     <div className="tile">
@@ -1267,16 +1354,13 @@ export default function CameraTile({ cam }) {
           <span className="name">{cam.name}</span>
           <span className="location">{cam.location}</span>
         </div>
-        <div className="tile-status-icons">
-          <FireStatusButton
-            isFire={displayFireStatus}
-            alertType={displayAlertType}
-            key={`fire-${displayFireStatus}-${displayAlertType}`}
-          />
-        </div>
       </div>
       <div className="video-wrap" onMouseEnter={() => setViewed(true)}>
         <video ref={videoRef} autoPlay muted playsInline controls />
+        <canvas
+          ref={backendCanvasRef}
+          style={{ position: "absolute", pointerEvents: "none", zIndex: 10 }}
+        />
         {(showSpinner || (status !== "Streaming…" && status !== "Idle")) && (
           <div className="status-overlay">
             {showSpinner ? (
@@ -1286,6 +1370,14 @@ export default function CameraTile({ cam }) {
               status.includes("Error") ? (
               <FaExclamationCircle className="status-icon error" size={32} />
             ) : null}
+          </div>
+        )}
+        {displayLabel && (
+          <div
+            className="detection-label"
+            style={{ borderLeftColor: detectionLabelColor, color: detectionLabelColor }}
+          >
+            {displayLabel}
           </div>
         )}
       </div>

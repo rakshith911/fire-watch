@@ -145,10 +145,27 @@ const seed = [
 
 const CamerasCtx = createContext(null);
 
+const HISTORY_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_EVENTS_PER_CAM = 200;
+
+function threatCategory(alertType) {
+  if (!alertType) return "clear";
+  const t = alertType.toLowerCase();
+  if (t.includes("smoke")) return "smoke";
+  if (t.includes("large") || t.includes("big")) return "large_fire";
+  if (t.includes("fire")) return "small_fire";
+  if (t.includes("threat") || t.includes("weapon") || t.includes("knife")) return "weapon_threat";
+  if (t.includes("weapon") || t.includes("knife")) return "weapon";
+  if (t.includes("face") || t.includes("mask")) return "face_covered";
+  if (t.includes("loiter")) return "loitering";
+  return "fire";
+}
+
 export function CamerasProvider({ children }) {
   // Initialize with seed data if in seed mode, empty array if in DB mode
   const [cameras, setCameras] = useState(USE_SEED_DATA ? seed : []);
   const [cameraStatuses, setCameraStatuses] = useState({});
+  const [cameraHistory, setCameraHistory] = useState({});
   const [loading, setLoading] = useState(!USE_SEED_DATA); // Loading state for DB mode
   const [error, setError] = useState(null);
 
@@ -298,6 +315,48 @@ export function CamerasProvider({ children }) {
     []
   );
 
+  const pushDetectionEvent = useMemo(
+    () => (cameraId, isFire, data = {}) => {
+      const now = Date.now();
+      const cutoff = now - HISTORY_WINDOW_MS;
+
+      setCameraHistory((prev) => {
+        const existing = prev[cameraId] || [];
+        // Prune events older than the window
+        const pruned = existing.filter(
+          (e) => (e.endTime ?? now) >= cutoff
+        );
+
+        if (isFire) {
+          // Close any open event first
+          const closed = pruned.map((e) =>
+            e.endTime == null ? { ...e, endTime: now } : e
+          );
+          const category = threatCategory(data.alertType);
+          const newEvent = {
+            id: `${cameraId}-${now}`,
+            category,
+            alertType: data.alertType || "Fire",
+            confidence: data.confidence ?? null,
+            startTime: now,
+            endTime: null,
+          };
+          return {
+            ...prev,
+            [cameraId]: [...closed, newEvent].slice(-MAX_EVENTS_PER_CAM),
+          };
+        } else {
+          // Close the last open event
+          const closed = pruned.map((e) =>
+            e.endTime == null ? { ...e, endTime: now } : e
+          );
+          return { ...prev, [cameraId]: closed };
+        }
+      });
+    },
+    []
+  );
+
   const toggleCameraVisibility = useMemo(
     () => (cameraId) => {
       setCameraVisibility((prev) => {
@@ -415,7 +474,9 @@ export function CamerasProvider({ children }) {
         isStreaming: cameraStatuses[cam.id]?.isStreaming || false,
         isVisible: cameraVisibility[cam.id] !== false, // default to true if not set
         alertType: cameraStatuses[cam.id]?.alertType || null,
+        persistentLabel: cameraStatuses[cam.id]?.persistentLabel || null,
         boxes: cameraStatuses[cam.id]?.boxes || [],
+        detectionHistory: cameraHistory[cam.id] || [],
       }));
       console.log(`[Camera Store] 📹 camerasWithStatus recomputed:`,
         result.map(c => ({ id: c.id, name: c.name, isFire: c.isFire, isStreaming: c.isStreaming, boxes: c.boxes.length }))
@@ -431,6 +492,7 @@ export function CamerasProvider({ children }) {
       addCamera,
       setCameras,
       updateCameraStatus,
+      pushDetectionEvent,
       updateCamera,
       toggleCameraVisibility,
       setCameraVisibilities,
@@ -448,6 +510,7 @@ export function CamerasProvider({ children }) {
       camerasWithStatus,
       addCamera,
       updateCameraStatus,
+      pushDetectionEvent,
       updateCamera,
       toggleCameraVisibility,
       setCameraVisibilities,

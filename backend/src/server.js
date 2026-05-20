@@ -298,9 +298,12 @@ app.get("/diagnostics", async (_req, res) => {
 
   const requiredModels = [
     "best.onnx",
+    "best_s.onnx",
     "weapons.onnx",
-    "theft.onnx",
-    "depth_anything_v2_small.onnx"
+    "weapons_yolo.onnx",
+    "yolov11n_bestFire.onnx",
+    "yolov8n.onnx",
+    "yolov8n-pose.onnx",
   ];
 
   const modelStatus = {};
@@ -355,20 +358,25 @@ app.get("*", (req, res) => {
 });
 
 // -------------------------------------------------------------------
-// 🔍 Model Diagnostics - Check all required models at startup
+// 🔍 Model Diagnostics + Auto-Download
 // -------------------------------------------------------------------
+// Models that MUST exist before detection starts (no public fallback)
+const STATIC_MODELS = [
+  { name: "best.onnx",              purpose: "Fire/Smoke Detection (RT-DETR, primary)" },
+  { name: "best_s.onnx",            purpose: "Small Fire Detection (candles/embers)" },
+  { name: "weapons.onnx",           purpose: "Weapon Detection (RT-DETR, high accuracy)" },
+  { name: "weapons_yolo.onnx",      purpose: "Weapon Detection (YOLOv8n, fast)" },
+  { name: "yolov11n_bestFire.onnx", purpose: "Fire Detection (YOLOv11n, fast)" },
+  { name: "yolov8n.onnx",           purpose: "Person Detection (behavioral pipeline)" },
+  { name: "yolov8n-pose.onnx",      purpose: "Pose Estimation (behavioral pipeline)" },
+];
+
 function checkModelsAtStartup() {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
   const modelsDir = process.env.MODELS_DIR_OVERRIDE
     ? process.env.MODELS_DIR_OVERRIDE
     : path.resolve(__dirname, "../models");
-
-  const requiredModels = [
-    { name: "best.onnx", purpose: "Fire Detection" },
-    { name: "weapons.onnx", purpose: "Weapon Detection" },
-    { name: "depth_anything_v2_small.onnx", purpose: "Liveness/Depth Check" },
-  ];
 
   log.info("═══════════════════════════════════════════════════════════");
   log.info("🔍 MODEL DIAGNOSTICS");
@@ -378,18 +386,13 @@ function checkModelsAtStartup() {
   let allPresent = true;
   const modelStatus = [];
 
-  for (const model of requiredModels) {
+  for (const model of STATIC_MODELS) {
     const modelPath = path.join(modelsDir, model.name);
     const exists = fs.existsSync(modelPath);
     let size = 0;
 
     if (exists) {
-      try {
-        const stats = fs.statSync(modelPath);
-        size = stats.size;
-      } catch (e) {
-        size = -1;
-      }
+      try { size = fs.statSync(modelPath).size; } catch { size = -1; }
     } else {
       allPresent = false;
     }
@@ -399,12 +402,14 @@ function checkModelsAtStartup() {
       purpose: model.purpose,
       exists,
       sizeMB: exists ? (size / 1024 / 1024).toFixed(1) : "N/A",
-      path: modelPath
+      path: modelPath,
     };
     modelStatus.push(status);
 
     if (exists) {
       log.info({ ...status }, `✅ ${model.name}`);
+    } else if (isAutoDownload) {
+      log.info({ ...status }, `⬇️  ${model.name} — will auto-download on first use`);
     } else {
       log.error({ ...status }, `❌ ${model.name} - MISSING!`);
     }
@@ -413,7 +418,7 @@ function checkModelsAtStartup() {
   log.info("═══════════════════════════════════════════════════════════");
 
   if (!allPresent) {
-    log.error("⚠️ SOME MODELS ARE MISSING! Detection may not work properly.");
+    log.error("⚠️ SOME REQUIRED MODELS ARE MISSING! Detection may not work properly.");
     log.error("Models should be at: " + modelsDir);
   } else {
     log.info("✅ All required models present");

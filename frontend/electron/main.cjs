@@ -300,12 +300,13 @@ function resolveFfmpegPath() {
 async function checkResources() {
   // Backend models (downloaded to userData/models/, used by the Node backend)
   const REQUIRED_MODELS = [
-    { name: "best.onnx", minSize: 130000000, type: "backend_model" },           // ~131MB
-    { name: "best_s.onnx", minSize: 120000000, type: "backend_model" },         // ~123MB
-    { name: "weapons.onnx", minSize: 130000000, type: "backend_model" },        // ~131MB
-    { name: "depth_anything_v2_small.onnx", minSize: 98000000, type: "backend_model" }, // ~99MB
-    { name: "yolov11n_bestFire.onnx", minSize: 9000000, type: "frontend_model" },  // ~10MB
-    { name: "weapons_yolo.onnx", minSize: 11000000, type: "frontend_model" }        // ~12MB
+    { name: "best.onnx",              minSize: 130000000, type: "backend_model" }, // ~131MB RT-DETR fire/smoke
+    { name: "best_s.onnx",            minSize: 120000000, type: "backend_model" }, // ~123MB RT-DETR small fire (candles)
+    { name: "weapons.onnx",           minSize: 130000000, type: "backend_model" }, // ~131MB RT-DETR weapon
+    { name: "weapons_yolo.onnx",      minSize: 11000000,  type: "backend_model" }, // ~12MB  YOLOv8n weapon (fast)
+    { name: "yolov11n_bestFire.onnx", minSize: 9000000,   type: "backend_model" }, // ~10MB  YOLOv11n fire (fast)
+    { name: "yolov8n.onnx",           minSize: 5000000,   type: "backend_model" }, // ~6MB   person detection
+    { name: "yolov8n-pose.onnx",      minSize: 5000000,   type: "backend_model" }, // ~6MB   pose estimation
   ];
 
   // Also check for mediamtx binary (ffmpeg is bundled with the app)
