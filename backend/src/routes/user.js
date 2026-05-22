@@ -1,9 +1,9 @@
 import { Router } from "express";
 import { dynamodb } from "../db/dynamodb.js";
 import { updateSamplingRate } from "../services/detectionQueue.js";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 
-const log = pino({ name: "user-routes" });
+const log = makeLogger("user-routes");
 
 export const user = Router();
 

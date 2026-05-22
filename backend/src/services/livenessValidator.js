@@ -3,14 +3,10 @@ import sharp from "sharp";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
+import { makeLogger } from "../logger.js";
 
-
+const log = makeLogger("liveness-validator");
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-function log(msg, data) {
-    if (data) console.log(msg, JSON.stringify(data));
-    else console.log(msg);
-}
 
 class LivenessValidator {
     constructor() {
@@ -29,14 +25,14 @@ class LivenessValidator {
     async init() {
         if (!this.session) {
             if (!fs.existsSync(this.modelPath)) {
-                console.error(`[LivenessValidator] Model not found at: ${this.modelPath}`);
+                log.error({ modelPath: this.modelPath }, "Depth model not found");
                 return;
             }
             try {
                 this.session = await ort.InferenceSession.create(this.modelPath);
-                console.log('[LivenessValidator] Depth model loaded successfully.');
+                log.info({ modelPath: this.modelPath }, "Depth model loaded successfully");
             } catch (err) {
-                console.error('[LivenessValidator] Failed to load depth model:', err);
+                log.error({ err: err.message, stack: err.stack }, "Failed to load depth model");
             }
         }
     }
@@ -184,11 +180,24 @@ class LivenessValidator {
             const isFlatScreen = ultraCenterStdDev < FLAT_SCREEN_THRESHOLD && depthDiff > DIFF_THRESHOLD;
             const is3D = passes3D && !isFlatScreen;
 
-            console.log(`[Liveness] 🔍 DEPTH ANALYSIS: insideStdDev=${insideStdDev.toFixed(4)}, depthDiff=${depthDiff.toFixed(4)}, ultraCenterStdDev=${ultraCenterStdDev.toFixed(4)}, insideMean=${insideMean.toFixed(4)}, outsideMean=${outsideMean.toFixed(4)}, threshold=${DEPTH_THRESHOLD}/${DIFF_THRESHOLD}/${FLAT_SCREEN_THRESHOLD}, min=${min.toFixed(4)}, max=${max.toFixed(4)}, pixels=${insideValues.length}(inside)/${outsideValues.length}(outside)/${ultraCenterValues.length}(ultraCenter), RESULT=${is3D ? '3D_REAL' : isFlatScreen ? '2D_PHONE_SCREEN' : '2D_FLAT'}`);
+            log.info({
+                insideStdDev: insideStdDev.toFixed(4),
+                depthDiff: depthDiff.toFixed(4),
+                ultraCenterStdDev: ultraCenterStdDev.toFixed(4),
+                insideMean: insideMean.toFixed(4),
+                outsideMean: outsideMean.toFixed(4),
+                thresholds: [DEPTH_THRESHOLD, DIFF_THRESHOLD, FLAT_SCREEN_THRESHOLD],
+                min: min.toFixed(4),
+                max: max.toFixed(4),
+                insidePixels: insideValues.length,
+                outsidePixels: outsideValues.length,
+                ultraCenterPixels: ultraCenterValues.length,
+                result: is3D ? '3D_REAL' : isFlatScreen ? '2D_PHONE_SCREEN' : '2D_FLAT',
+            }, "Depth analysis");
 
             return is3D;
         } catch (err) {
-            console.error("[Liveness] Error processing weapon depth:", err);
+            log.error({ err: err.message, stack: err.stack }, "Error processing weapon depth");
             return true; // Fail safe
         }
     }
@@ -258,7 +267,12 @@ class LivenessValidator {
 
             const ratio = movingPixels / totalPixels;
             const avgDiff = movingPixels > 0 ? totalDiffMagnitude / movingPixels : 0;
-            console.log(`[Liveness] Fire Motion: ratio=${ratio.toFixed(5)} (${movingPixels}/${totalPixels} pixels), avgDiff=${avgDiff.toFixed(1)}`);
+            log.info({
+                ratio: ratio.toFixed(5),
+                movingPixels,
+                totalPixels,
+                avgDiff: avgDiff.toFixed(1),
+            }, "Fire motion");
 
             // Return ratio instead of boolean — caller uses context-dependent thresholds:
             // - Moving boxes (IoU < 0.85): ratio > 0.10 (10%) = real fire
@@ -266,7 +280,7 @@ class LivenessValidator {
             //   Phone screens produce ~0.05-0.14, real fire produces 0.25-0.50+
             return ratio;
         } catch (err) {
-            console.error("[Liveness] Error processing fire motion:", err);
+            log.error({ err: err.message, stack: err.stack }, "Error processing fire motion");
             return 0; // Return 0 ratio on error
         }
     }
@@ -295,10 +309,10 @@ class LivenessValidator {
                 if (Math.abs(crop1[i] - crop2[i]) > 30) changed++;
             }
             const ratio = changed / total;
-            console.log(`[Liveness] Inter-cycle diff: ratio=${ratio.toFixed(5)} (${changed}/${total} pixels)`);
+            log.info({ ratio: ratio.toFixed(5), changed, total }, "Inter-cycle diff");
             return ratio;
         } catch (err) {
-            console.error("[Liveness] Inter-cycle compare error:", err);
+            log.error({ err: err.message, stack: err.stack }, "Inter-cycle compare error");
             return 0;
         }
     }

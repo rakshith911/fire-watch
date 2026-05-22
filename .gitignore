@@ -19,7 +19,11 @@ frontend/dist-electron/
 
 # Model weights (downloaded at runtime from S3)
 backend/models/*.onnx
+frontend/models/*.onnx
 *.pt
+
+# Runtime logs
+logs/
 
 # Binaries
 backend/mediamtx

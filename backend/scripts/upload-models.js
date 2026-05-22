@@ -27,7 +27,11 @@ const MODELS_DIR = path.join(BACKEND_ROOT, "models");
 // Models to upload — those with a publicUrl are auto-fetched if not already local
 const MODELS = [
     { file: "best.onnx",                    publicUrl: null },
+    { file: "best_s.onnx",                  publicUrl: null },
     { file: "weapons.onnx",                 publicUrl: null },
+    { file: "weapons_yolo.onnx",            publicUrl: null },
+    { file: "knife_yolov8n.onnx",           publicUrl: null },
+    { file: "mask_yolov5.onnx",             publicUrl: null },
     { file: "depth_anything_v2_small.onnx", publicUrl: null },
     { file: "yolov8n.onnx",                 publicUrl: "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.onnx" },
     { file: "yolov8n-pose.onnx",            publicUrl: "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n-pose.onnx" },

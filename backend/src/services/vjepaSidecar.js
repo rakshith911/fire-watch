@@ -4,9 +4,9 @@
 import { spawn } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 
-const log = pino({ name: "vjepa-sidecar" });
+const log = makeLogger("vjepa-sidecar");
 const SIDECAR_PATH = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../vjepa/sidecar.py"
@@ -22,7 +22,7 @@ function start() {
 
   log.info("Spawning V-JEPA sidecar…");
   proc = spawn("python3", [SIDECAR_PATH], {
-    stdio: ["pipe", "pipe", "inherit"], // stdin, stdout piped; stderr → parent stderr
+    stdio: ["pipe", "pipe", "pipe"],
   });
 
   proc.stdout.setEncoding("utf8");
@@ -48,6 +48,12 @@ function start() {
       }
     }
   });
+  proc.stderr.setEncoding("utf8");
+  proc.stderr.on("data", (chunk) => {
+    for (const line of chunk.split("\n")) {
+      if (line.trim()) log.warn({ sidecar: "stderr" }, line.trim());
+    }
+  });
 
   proc.on("exit", (code) => {
     log.warn({ code }, "V-JEPA sidecar exited — will restart on next call");
@@ -70,7 +76,7 @@ function send(msg) {
   });
 }
 
-function waitReady(timeoutMs = 60000) {
+function waitReady(timeoutMs = 300000) {
   return new Promise((resolve, reject) => {
     if (ready) return resolve();
     const deadline = Date.now() + timeoutMs;
@@ -87,16 +93,16 @@ export function startSidecar() {
   start();
 }
 
-export function waitSidecarReady(timeoutMs = 120000) {
+export function waitSidecarReady(timeoutMs = 300000) {
   return waitReady(timeoutMs);
 }
 
 /**
  * Fire/smoke tier-2 temporal inference via VideoMAE.
  * @param {string[]} framesB64 - base64-encoded JPEG frames
- * @param {"B"|"H"} modelSize
+ * @param {"H"} modelSize
  */
-export async function inferClip(framesB64, modelSize = "B") {
+export async function inferClip(framesB64, modelSize = "H") {
   if (!proc) start();
   await waitReady();
   return send({ cmd: "infer", frames_b64: framesB64, model: modelSize });
@@ -129,6 +135,19 @@ export async function classifySequenceWithClip(framesB64, prompts = null, labels
   if (prompts) msg.prompts = prompts;
   if (labels)  msg.labels  = labels;
   return send(msg);
+}
+
+/**
+ * V-JEPA intra-sequence temporal variance.
+ * Computes VideoMAE embeddings for the first half and second half of the clip,
+ * then returns cosine similarity. High similarity = frames barely changed (static image
+ * or looping clip). Low similarity = scene genuinely evolving (real fire).
+ * Returns { temporal_similarity, is_static, inference_ms }
+ */
+export async function getTemporalVariance(framesB64) {
+  if (!proc) start();
+  await waitReady();
+  return send({ cmd: "frame_temporal_variance", frames_b64: framesB64 });
 }
 
 /**

@@ -2,13 +2,13 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 import os from "node:os";
 import { cfg } from "../config.js";
 import { generateMediaMTXConfig } from "./mediamtxConfigGenerator.js";
 import { fileURLToPath } from "url";
 
-const log = pino({ name: "mediamtx" });
+const log = makeLogger("mediamtx");
 
 let mtxProcess = null;
 

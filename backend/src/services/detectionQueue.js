@@ -1,6 +1,9 @@
-import pino from "pino";
 import sharp from "sharp";
-import { detectFireMultiFrame, buildCameraUrl, grabFrameOnce } from "./localDetector.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { detectFireMultiModelFrame, buildCameraUrl, grabFrameOnce } from "./localDetector.js";
+import { detectFireMultiFrameYolo } from "./localYoloDetector.js";
 import livenessValidator from "./livenessValidator.js";
 import { startCameraStream, stopCameraStream, isStreamActive } from "./streamManager.js";
 import { sanitizePathName } from "./mediamtxConfigGenerator.js";
@@ -11,26 +14,64 @@ import {
   waitSidecarReady,
   classifySequenceWithClip,
   getAnomalyScore,
+  getTemporalVariance,
 } from "./vjepaSidecar.js";
 import { cropLargestPerson } from "./personDetector.js";
-import { detectWeaponYolo } from "./localYoloDetector.js";
+import { detectMaskYolo, detectWeaponYolo } from "./localYoloDetector.js";
 import { getLargestPersonPose } from "./poseDetector.js";
 import { ByteTracker } from "./byteTracker.js";
+import { makeLogger } from "../logger.js";
 
-const log = pino({ name: "detection-queue" });
+const log = makeLogger("detection-queue");
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ─── Constants ──────────────────────────────────────────────────────────────
-const CYCLE_INTERVAL_MS          = 3000;   // pause between full cycles per camera
+const CYCLE_INTERVAL_MS          = 1000;   // pause between full cycles per camera
 const FRAMES_PER_CYCLE           = 3;      // frames grabbed in each initial check
 const RECHECK_COUNT              = 2;      // immediate rechecks after initial fire detection
 const CONFIRM_THRESHOLD          = 2;      // checks that must confirm out of (1 + RECHECK_COUNT)
-const BOX_MOVE_IOU_THRESHOLD     = 0.70;   // IOU below this = bbox moved significantly
-const FIRE_MOTION_THRESHOLD      = 0.10;   // pixel-motion ratio that bypasses CLIP verification
+const BOX_MOVE_IOU_THRESHOLD     = 0.70;   // IOU below this = bbox moved significantly (multi-check gate)
+const BBOX_STABLE_IOU_THRESH     = 0.98;   // consecutive pairs must be near-identical to count as stable (any small shift = not static)
+const PIXEL_MOTION_STATIC_THRESH = 0.08;   // fire-crop pixel motion below this = essentially no movement
+const PIXEL_MOTION_SUSPICIOUS    = 0.20;   // below this = phone-screen / very low motion range
+const PIXEL_MOTION_REAL_THRESH   = 0.20;   // strong flame-region motion = active dynamic fire signal
+const CENTER_DISP_STATIC_THRESH  = 0.01;   // bbox center moved < 1% of bbox diagonal = static signal (was 5% — lowered so small movement is enough)
+const CENTER_DISP_REAL_THRESH    = 0.10;   // significant bbox-center movement = dynamic fire signal
 const INTER_CYCLE_THRESHOLD      = 0.04;   // inter-cycle pixel diff for long-GOP cameras
+const INTER_CYCLE_STATIC_THRESH  = 0.005;  // inter-cycle ratio below this = effectively no change
 const BEHAVIORAL_COOLDOWN_MS     = 30_000; // min ms between same behavioral label per camera
 const ALERT_COOLDOWN_MS          = 60_000; // min ms between SNS/S3 alerts per camera
 const FAST_PERSON_INTERVAL_MS    = 1_000;  // fast person-detection loop interval
 const PERSON_CLEAR_DELAY_MS      = 5_000;  // ms after person leaves before clearing label
+
+// Reasons that should set staticRejectedUntil cooldown
+const STATIC_REJECT_REASONS = new Set([
+  "clip_static_photo", "clip_screen_video",
+  "multi_static_signal", "inter_cycle_static",
+  "static_sidecar_error", "clip_no_fire_suspicious",
+]);
+
+const missingFireModelsLogged = new Set();
+
+function getModelsDir() {
+  return process.env.MODELS_DIR_OVERRIDE || path.resolve(__dirname, "../../models");
+}
+
+function fireModelForAiType() {
+  return "best.onnx";
+}
+
+function getFireModelFiles(aiType) {
+  const modelFile = fireModelForAiType(aiType);
+  const modelsDir = getModelsDir();
+  const exists = fs.existsSync(path.join(modelsDir, modelFile));
+  if (!exists && !missingFireModelsLogged.has(modelFile)) {
+    missingFireModelsLogged.add(modelFile);
+    log.warn({ modelFile, modelsDir }, "⚠️ Fire model missing — falling back to best.onnx");
+    return ["best.onnx"];
+  }
+  return [modelFile];
+}
 
 // CLIP prompts used when fire/smoke detection clears — understand WHY it disappeared
 const FIRE_CLEAR_PROMPTS = [
@@ -46,15 +87,20 @@ const FIRE_CLEAR_LABELS = [
   "Scene returned to normal",
 ];
 
-// CLIP prompts used to distinguish real fire/smoke from a static photo / screen
+// CLIP prompts — three frames are tiled side-by-side (start / mid / end of clip).
+// Prompts explicitly reference the tiled composite so CLIP can use temporal change
+// (or lack thereof) as a classification signal.
 const FIRE_VERIFY_PROMPTS = [
-  "real fire actively burning with visible moving flames",
-  "thick dark smoke rising through the air without visible flames",
-  "a photograph, poster, painting, or printed picture of fire on a flat surface",
-  "a TV screen, monitor, or digital display showing fire footage or video",
-  "a normal scene with no fire or smoke present",
+  "three frames of real fire burning: flame shapes and brightness are visibly different between panels showing actual movement",
+  "three frames of thick dark smoke spreading and rising: the smoke position and density changes across the three panels",
+  "three nearly identical frames of a static fire photograph or printed image on a flat surface — no change between panels",
+  "three nearly identical frames of a phone, tablet, or screen displaying a fire image — glowing flat panel, scene does not change",
+  "three frames of a completely normal room or scene with no fire smoke or heat visible",
 ];
 const FIRE_VERIFY_LABELS = ["fire", "smoke", "static_photo", "screen_video", "no_fire"];
+
+const MASK_ALERT_THRESHOLD = 0.75;
+const MASK_CONFIRM_FRAMES = 2;
 
 // ─── Module state ────────────────────────────────────────────────────────────
 const cameraStates   = new Map(); // id → state object
@@ -107,31 +153,114 @@ function initCameraState() {
     personPresent:       false,
     lastPersonSeen:      0,
     entryClearPending:   false,
+    lastPersonCycle:     0,   // consecutive cycles with person present; 0 = absent last cycle
     // Weapon tracking (for box-clear when weapon disappears)
     isWeapon:            false,
+    weaponMissStreak:    0,    // consecutive cycles without weapon; clear after 2
+    isMask:              false,
+    maskConfirmStreak:   0,
+    maskMissStreak:      0,
+    // Static/screen rejection cooldown — require real bbox motion to re-confirm
+    staticRejectedUntil: 0,
   };
 }
 
-// ─── Fire verification (multi-check + JEPA/CLIP) ─────────────────────────────
-async function verifyFireWithClip(fireFrames, cameraId) {
+// ─── Fire verification — 4 cascading layers ──────────────────────────────────
+//
+//  Layer 1 (caller): bbox stability across all consecutive frame pairs
+//  Layer 2 (caller): pixel motion in the fire crop region (livenessValidator)
+//  Layer 3 (here):   V-JEPA temporal variance — do the actual frames change?
+//  Layer 4 (here):   CLIP semantic classification (always runs, threshold adjusts)
+//
+//  signals = { pixelMotion, bboxStable, centerDisplacement }
+async function verifyFireWithClip(fireFrames, cameraId, signals = {}) {
+  const { pixelMotion = 0, bboxStable = false, centerDisplacement = 0 } = signals;
   const framesB64 = fireFrames.filter(f => f.frameBuffer).map(f => f.frameBuffer.toString("base64"));
+
   if (framesB64.length === 0) return { isReal: true, alertType: "Fire", reason: "no_frames" };
 
+  // ── Count pre-CLIP static evidence ──────────────────────────────────────────
+  // Each signal is independently strong — a static image reliably shows all three.
+  let staticSignals = 0;
+  if (pixelMotion < PIXEL_MOTION_STATIC_THRESH) staticSignals++;  // fire crop pixels not changing
+  if (bboxStable)                               staticSignals++;  // detection box didn't move
+  if (centerDisplacement < CENTER_DISP_STATIC_THRESH) staticSignals++; // bbox center moved < 5% of diagonal
+
+  log.info({ cameraId, pixelMotion: pixelMotion.toFixed(4), bboxStable, centerDisplacement: centerDisplacement.toFixed(4), staticSignals },
+    "📊 Pre-CLIP liveness signals");
+
+  // All 3 pixel/bbox signals agree → very high confidence static image, skip CLIP
+  if (staticSignals === 3) {
+    log.warn({ cameraId }, "🖼️ All 3 motion signals indicate static — rejecting before CLIP");
+    return { isReal: false, reason: "multi_static_signal" };
+  }
+
+  // ── Layer 3: V-JEPA temporal variance ─────────────────────────────────────
+  // Ask VideoMAE: are the first-half and second-half of this clip similar?
+  // Static image → embeddings nearly identical → is_static = true.
+  // Real fire → flames evolve between halves → is_static = false.
+  let jepaStatic = false;
+  try {
+    const jepa = await getTemporalVariance(framesB64);
+    jepaStatic = jepa.is_static ?? false;
+    if (jepaStatic) staticSignals++;
+    log.info({ cameraId, temporal_similarity: jepa.temporal_similarity, jepaStatic, staticSignals },
+      "🎥 V-JEPA temporal variance");
+  } catch (jepaErr) {
+    log.warn({ err: jepaErr.message }, "⚠️ V-JEPA temporal variance unavailable");
+  }
+
+  // 3+ signals including V-JEPA → strong static rejection before CLIP
+  if (staticSignals >= 3) {
+    log.warn({ cameraId, staticSignals }, "🖼️ 3+ signals (incl. V-JEPA) indicate static — rejecting before CLIP");
+    return { isReal: false, reason: "multi_static_signal" };
+  }
+
+  // ── Layer 4: CLIP semantic classification (always runs) ──────────────────
   try {
     const clip = await classifySequenceWithClip(framesB64, FIRE_VERIFY_PROMPTS, FIRE_VERIFY_LABELS);
-    log.info({ cameraId, label: clip.label, prob: clip.top_prob }, "🔍 CLIP fire verification");
+    log.info({ cameraId, label: clip.label, prob: clip.top_prob?.toFixed(3), staticSignals },
+      "🔍 CLIP fire verification");
 
     if (clip.label === "static_photo" || clip.label === "screen_video") {
+      const strongMotionEvidence =
+        pixelMotion >= PIXEL_MOTION_REAL_THRESH &&
+        !jepaStatic &&
+        (!bboxStable || centerDisplacement >= CENTER_DISP_REAL_THRESH);
+
+      if (strongMotionEvidence) {
+        log.info({
+          cameraId,
+          label: clip.label,
+          pixelMotion: pixelMotion.toFixed(4),
+          temporalStatic: jepaStatic,
+          centerDisplacement: centerDisplacement.toFixed(4),
+        }, "🔥 Strong liveness evidence overrides CLIP static/screen label");
+        return { isReal: true, alertType: "Fire", reason: "motion_overrode_clip_static" };
+      }
+
       return { isReal: false, reason: `clip_${clip.label}`, prob: clip.top_prob };
     }
+
+    // With 2+ suspicious signals: no_fire label at any confidence is enough to reject.
+    // Real fire CLIP confidence is often 0.38-0.58 — never reject based on low prob alone.
+    if (staticSignals >= 2 && clip.label === "no_fire") {
+      return { isReal: false, reason: "clip_no_fire_suspicious", prob: clip.top_prob };
+    }
+    // Normal case: only reject on no_fire with > 0.50 confidence
     if (clip.label === "no_fire" && clip.top_prob > 0.50) {
       return { isReal: false, reason: "clip_no_fire", prob: clip.top_prob };
     }
 
-    // CLIP directly tells us fire vs smoke
     const alertType = clip.label === "smoke" ? "Smoke" : "Fire";
     return { isReal: true, alertType };
+
   } catch (err) {
+    // Sidecar failure — fall back to static signals if we have 2+
+    if (staticSignals >= 2) {
+      log.warn({ cameraId, staticSignals }, "⚠️ CLIP failed with 2+ static signals — rejecting");
+      return { isReal: false, reason: "static_sidecar_error" };
+    }
     log.warn({ err: err.message }, "⚠️ CLIP verification failed — defaulting to real");
     return { isReal: true, alertType: "Fire", reason: "verification_error" };
   }
@@ -147,9 +276,11 @@ async function runWeaponPipeline(camera, state, cameraUrl) {
     if (result.transientReadError) return;
 
     if (!result.isWeapon || result.boxes.length === 0) {
-      // Weapon gone — send explicit clear so frontend wipes the boxes immediately
-      if (state.isWeapon) {
+      state.weaponMissStreak = (state.weaponMissStreak ?? 0) + 1;
+      // Require 2 consecutive misses before declaring weapon gone (avoids false clears on single bad frame)
+      if (state.isWeapon && state.weaponMissStreak >= 2) {
         state.isWeapon = false;
+        state.weaponMissStreak = 0;
         log.info({ cameraId: camera.id }, "🔫 Weapon gone — clearing boxes");
         if (broadcastFireDetection) {
           broadcastFireDetection(camera.userId, camera.id, camera.name, false, {
@@ -161,12 +292,25 @@ async function runWeaponPipeline(camera, state, cameraUrl) {
     }
 
     state.isWeapon = true;
+    state.weaponMissStreak = 0;
     const now      = Date.now();
     const lastSent = state.clipCooldowns["weapon"] || 0;
-    if (now - lastSent < WEAPON_COOLDOWN_MS) return;
+    const label    = result.boxes[0]?.[4] || "Knife";
+
+    if (now - lastSent < WEAPON_COOLDOWN_MS) {
+      // Within cooldown — still push fresh boxes so they track the weapon's position
+      if (broadcastFireDetection) {
+        broadcastFireDetection(camera.userId, camera.id, camera.name, true, {
+          boxes:        result.boxes,
+          alertType:    label,
+          confidence:   result.confidence,
+          isBehavioral: true,
+        });
+      }
+      return;
+    }
 
     state.clipCooldowns["weapon"] = now;
-    const label = result.boxes[0]?.[4] || "Knife";
     log.info({ cameraId: camera.id, label, conf: result.confidence?.toFixed(3) }, "🔫 Weapon detected — broadcasting");
 
     if (broadcastFireDetection) {
@@ -198,12 +342,11 @@ async function runBehavioralPipeline(frames, camera, state, cameraUrl) {
     const refFrame = allBufs[Math.floor(allBufs.length / 2)];
     let cropBox = null;
 
-    const posePerson = await getLargestPersonPose(refFrame).catch(() => null);
-    cropBox = posePerson?.box ?? null;
-    if (!cropBox) {
-      const personResult = await cropLargestPerson(refFrame).catch(() => null);
-      cropBox = personResult?.box ?? null;
-    }
+    const [posePerson, personFallback] = await Promise.all([
+      getLargestPersonPose(refFrame).catch(() => null),
+      cropLargestPerson(refFrame).catch(() => null),
+    ]);
+    cropBox = posePerson?.box ?? personFallback?.box ?? null;
 
     let personCropsB64 = [];
     let detectedBoxes  = [];
@@ -212,6 +355,24 @@ async function runBehavioralPipeline(frames, camera, state, cameraUrl) {
       const [bx1, by1, bx2, by2] = cropBox;
       let fw = 640, fh = 480;
       try { const m = await sharp(refFrame).metadata(); fw = m.width; fh = m.height; } catch {}
+
+      // Entry-zone gate: only run behavioral CLIP when person is near an entry point.
+      // Heuristic: person centre must be in the bottom 55% of the frame OR within 30% of either side.
+      // This prevents "random person in middle of room" from triggering the pipeline.
+      const cy = (by1 + by2) / 2;
+      const cx = (bx1 + bx2) / 2;
+      const inEntryZone = cy > fh * 0.45 || cx < fw * 0.30 || cx > fw * 0.70;
+      if (!inEntryZone) {
+        log.info({ cameraId: camera.id, cy, cx, fw, fh }, "👤 Person outside entry zone — skipping behavioral pipeline");
+        // Clear any stale person boxes from a previous entry-zone detection
+        if (broadcastFireDetection && state.isWeapon === false) {
+          broadcastFireDetection(camera.userId, camera.id, camera.name, false, {
+            boxes: [], reason: "person_outside_zone",
+          });
+        }
+        return;
+      }
+
       const pw = (bx2 - bx1) * 0.15, ph = (by2 - by1) * 0.15;
       const left = Math.max(0, Math.floor(bx1 - pw));
       const top  = Math.max(0, Math.floor(by1 - ph));
@@ -223,7 +384,8 @@ async function runBehavioralPipeline(frames, camera, state, cameraUrl) {
           const crop = await sharp(buf).extract({ left, top, width: w, height: h }).toBuffer().catch(() => null);
           if (crop) personCropsB64.push(crop.toString("base64"));
         }
-        if (personCropsB64.length > 0) detectedBoxes = [cropBox];
+        // detectedBoxes intentionally left empty — person crop boxes from backend go stale
+        // and appear frozen when person moves. Weapon boxes come from runWeaponPipeline.
       }
     }
 
@@ -238,8 +400,20 @@ async function runBehavioralPipeline(frames, camera, state, cameraUrl) {
       ? personCropsB64
       : allBufs.map(b => b.toString("base64"));
 
-    // Tier 2: V-JEPA temporal gate (VideoMAE-B) — skip CLIP when activity is normal baseline
-    const anomaly = await getAnomalyScore(vjepaFrames, String(camera.id), false).catch(() => null);
+    const personDetected = personCropsB64.length > 0;
+
+    // Tier 2: V-JEPA temporal gate.
+    // When a person is in frame, pass isThreat=true so the baseline only learns
+    // from empty-room cycles — preventing "person present" from becoming "normal".
+    const anomaly = await getAnomalyScore(vjepaFrames, String(camera.id), personDetected).catch(() => null);
+
+    // A person arriving after being absent = "new arrival" — always worth classifying
+    // regardless of anomaly score, since the baseline doesn't capture arrivals.
+    const isNewArrival = personDetected && (state.lastPersonCycle ?? 0) === 0;
+
+    // Update consecutive-presence counter so the next cycle knows if this was an arrival.
+    state.lastPersonCycle = personDetected ? (state.lastPersonCycle ?? 0) + 1 : 0;
+
     log.info({
       cameraId:       camera.id,
       anomalyScore:   anomaly?.anomaly_score ?? null,
@@ -247,31 +421,132 @@ async function runBehavioralPipeline(frames, camera, state, cameraUrl) {
       baselineReady:  anomaly?.baseline_ready ?? null,
       samples:        anomaly?.baseline_samples ?? null,
       inferenceMs:    anomaly?.inference_ms ?? null,
-      usingCrops:     personCropsB64.length > 0,
+      usingCrops:     personDetected,
+      isNewArrival,
+      lastPersonCycle: state.lastPersonCycle,
     }, "🧠 V-JEPA anomaly gate");
 
-    if (anomaly?.baseline_ready && !anomaly?.anomaly_trigger) {
-      log.info({ cameraId: camera.id, score: anomaly.anomaly_score }, "🧠 V-JEPA: scene normal — skipping CLIP");
+    // Dedicated mask detector. Keep this out of CLIP: mask/no-mask is a visual
+    // object-detection task and should not rely on vague scene captions.
+    if (personDetected) {
+      try {
+        const maskResult = await detectMaskYolo(cameraUrl, camera.name, refFrame);
+        const rawMaskLabel = maskResult.boxes[0]?.[4] || null;
+        const maskLabel = rawMaskLabel === "mask_weared_incorrect"
+          ? "Suspicious — person wearing a mask incorrectly"
+          : rawMaskLabel === "with_mask"
+            ? "Suspicious — person wearing a face mask"
+            : null;
+
+        log.info({
+          cameraId: camera.id,
+          maskLabel,
+          rawMaskLabel,
+          confidence: maskResult.confidence,
+          boxes: maskResult.boxes.length,
+        }, maskLabel ? "🎭 Dedicated mask detector produced label" : "🎭 Dedicated mask detector clear");
+
+        const maskConfirmed = !!maskLabel && maskResult.confidence >= MASK_ALERT_THRESHOLD;
+        state.maskConfirmStreak = maskConfirmed ? (state.maskConfirmStreak || 0) + 1 : 0;
+
+        if (maskConfirmed) {
+          state.maskMissStreak = 0;
+
+          if (state.maskConfirmStreak >= MASK_CONFIRM_FRAMES) {
+            state.isMask = true;
+            const now = Date.now();
+            const lastSent = state.clipCooldowns[maskLabel] || 0;
+            if (now - lastSent > BEHAVIORAL_COOLDOWN_MS) {
+              state.clipCooldowns[maskLabel] = now;
+              log.info({
+                cameraId: camera.id,
+                label: maskLabel,
+                confidence: maskResult.confidence,
+                confirmStreak: state.maskConfirmStreak,
+              }, "🎭 Mask detection broadcast");
+              if (broadcastFireDetection) {
+                broadcastFireDetection(camera.userId, camera.id, camera.name, true, {
+                  boxes:        maskResult.boxes,
+                  alertType:    maskLabel,
+                  event:        maskLabel,
+                  clipLabel:    maskLabel,
+                  confidence:   maskResult.confidence,
+                  isBehavioral: true,
+                });
+              }
+            } else if (broadcastFireDetection) {
+              broadcastFireDetection(camera.userId, camera.id, camera.name, true, {
+                boxes:        maskResult.boxes,
+                alertType:    maskLabel,
+                clipLabel:    maskLabel,
+                confidence:   maskResult.confidence,
+                isBehavioral: true,
+              });
+            }
+          }
+        } else if (maskLabel) {
+          log.info({
+            cameraId: camera.id,
+            label: maskLabel,
+            confidence: maskResult.confidence,
+            threshold: MASK_ALERT_THRESHOLD,
+            confirmStreak: state.maskConfirmStreak,
+          }, "🎭 Mask label below confirmation gate — not broadcasting");
+          state.maskMissStreak = (state.maskMissStreak || 0) + 1;
+        } else {
+          state.maskMissStreak = (state.maskMissStreak || 0) + 1;
+        }
+
+        if (state.isMask && state.maskMissStreak >= MASK_CONFIRM_FRAMES) {
+          state.isMask = false;
+          state.maskMissStreak = 0;
+          log.info({ cameraId: camera.id }, "🎭 Mask gone — clearing mask label and boxes");
+          if (broadcastFireDetection) {
+            broadcastFireDetection(camera.userId, camera.id, camera.name, false, {
+              boxes: [],
+              reason: "mask_gone",
+              isBehavioral: true,
+            });
+          }
+        }
+      } catch (err) {
+        log.warn({ cameraId: camera.id, err: err.message }, "⚠️ Mask check failed");
+      }
+    } else {
+      if (state.isMask && broadcastFireDetection) {
+        log.info({ cameraId: camera.id }, "🎭 Person gone — clearing mask label and boxes");
+        broadcastFireDetection(camera.userId, camera.id, camera.name, false, {
+          boxes: [],
+          reason: "mask_gone",
+          isBehavioral: true,
+        });
+      }
+      state.isMask = false;
+      state.maskConfirmStreak = 0;
+      state.maskMissStreak = 0;
+    }
+
+    // Only run CLIP when the person just entered — not while they're standing around.
+    if (!isNewArrival) {
+      log.info({
+        cameraId: camera.id,
+        score:    anomaly?.anomaly_score ?? null,
+        samples:  anomaly?.baseline_samples ?? null,
+      }, "🧠 Person present but not new arrival — skipping CLIP");
       return;
     }
 
-    // While V-JEPA baseline is still building (first ~10 cycles), skip CLIP when
-    // no person is in the frame. Empty rooms produce low-confidence CLIP scores
-    // (~0.4) that land on random labels like "suspicious" or "camera redirected".
-    if (!anomaly?.baseline_ready && personCropsB64.length === 0) {
-      log.info({ cameraId: camera.id, samples: anomaly?.baseline_samples }, "⏳ Baseline building, no person — skipping CLIP");
-      return;
-    }
+    log.info({ cameraId: camera.id }, "🚶 New arrival — running CLIP");
 
     // Tier 3: CLIP sequence classification
     const clipResult = await classifySequenceWithClip(vjepaFrames);
-    const clipLabel  = clipResult.label;
+    const clipLabel  = clipResult.label;  // null means CLIP said "nothing alertable" — trust it
     log.info({
       cameraId: camera.id,
       clipLabel,
       prob:     clipResult.top_prob,
       inferMs:  clipResult.inference_ms,
-    }, clipLabel ? "🎯 CLIP label produced" : "🎯 CLIP: no label (below threshold or normal)");
+    }, clipLabel ? "🎯 CLIP label produced" : "🎯 CLIP: no label (screen/redirected/normal — suppressed)");
 
     if (!clipLabel) return;
 
@@ -328,6 +603,7 @@ async function runFastPersonCheck(camera, state) {
         if (elapsed >= PERSON_CLEAR_DELAY_MS) {
           state.personPresent     = false;
           state.entryClearPending = false;
+          state.lastPersonCycle   = 0;  // reset so next appearance is treated as new arrival
           log.info({ cameraId: camera.id, goneMs: elapsed }, "👤 Person gone — clearing label");
           broadcastFireDetection(camera.userId, camera.id, camera.name, false, {
             reason: "person_left",
@@ -340,6 +616,70 @@ async function runFastPersonCheck(camera, state) {
   }
 }
 
+// ─── Mask pipeline (mask_yolov5.onnx, every cycle, mask-only mode) ───────────
+async function runMaskPipeline(camera, state, cameraUrl) {
+  try {
+    const result = await detectMaskYolo(cameraUrl, camera.name);
+    if (!result || result.transientReadError) return;
+
+    if (!result.isMask || result.boxes.length === 0) {
+      state.maskMissStreak = (state.maskMissStreak || 0) + 1;
+      if (state.isMask && state.maskMissStreak >= MASK_CONFIRM_FRAMES) {
+        state.isMask = false;
+        state.maskMissStreak = 0;
+        state.maskConfirmStreak = 0;
+        log.info({ cameraId: camera.id }, "🎭 Mask gone — clearing boxes");
+        if (broadcastFireDetection) {
+          broadcastFireDetection(camera.userId, camera.id, camera.name, false, {
+            boxes: [], reason: "mask_gone", isBehavioral: true,
+          });
+        }
+      }
+      return;
+    }
+
+    const rawLabel = result.boxes[0]?.[4] || null;
+    const maskLabel = rawLabel === "mask_weared_incorrect"
+      ? "Suspicious — person wearing a mask incorrectly"
+      : rawLabel === "with_mask"
+        ? "Suspicious — person wearing a face mask"
+        : null;
+
+    if (!maskLabel) return;
+
+    const confirmed = result.confidence >= MASK_ALERT_THRESHOLD;
+    state.maskConfirmStreak = confirmed ? (state.maskConfirmStreak || 0) + 1 : 0;
+    if (!confirmed) {
+      state.maskMissStreak = (state.maskMissStreak || 0) + 1;
+      return;
+    }
+
+    state.maskMissStreak = 0;
+    if (state.maskConfirmStreak < MASK_CONFIRM_FRAMES) return;
+
+    state.isMask = true;
+    const now = Date.now();
+    const lastSent = state.clipCooldowns[maskLabel] || 0;
+    const isNewAlert = now - lastSent > BEHAVIORAL_COOLDOWN_MS;
+    if (isNewAlert) state.clipCooldowns[maskLabel] = now;
+
+    log.info({ cameraId: camera.id, maskLabel, confidence: result.confidence }, "🎭 Mask pipeline broadcast");
+
+    if (broadcastFireDetection) {
+      broadcastFireDetection(camera.userId, camera.id, camera.name, true, {
+        boxes:        result.boxes,
+        alertType:    maskLabel,
+        event:        isNewAlert ? maskLabel : undefined,
+        clipLabel:    maskLabel,
+        confidence:   result.confidence,
+        isBehavioral: true,
+      });
+    }
+  } catch (err) {
+    log.warn({ cameraId: camera.id, err: err.message }, "⚠️ Mask pipeline error");
+  }
+}
+
 // ─── Main per-camera detection cycle ─────────────────────────────────────────
 async function processCameraOnce(camera) {
   const state = cameraStates.get(camera.id);
@@ -348,12 +688,24 @@ async function processCameraOnce(camera) {
   const cameraUrl = getCameraUrl(camera);
   state.lastChecked  = new Date().toISOString();
   state.totalCycles  = (state.totalCycles || 0) + 1;
-  log.info({ id: camera.id, name: camera.name, cycle: state.totalCycles }, "🔄 Camera cycle start");
+  const aiType = camera.aiType || "FIRE";
+  log.info({ id: camera.id, name: camera.name, cycle: state.totalCycles, aiType }, "🔄 Camera cycle start");
 
-  // ── 1. Initial frame grab (3 frames) + YOLO ───────────────────────────────
+  // Non-fire modes skip the fire pipeline entirely and run their dedicated pipeline.
+  if (aiType === "WEAPON" || aiType === "WEAPON_YOLO") {
+    await runWeaponPipeline(camera, state, cameraUrl);
+    return;
+  }
+  if (aiType === "MASK") {
+    await runMaskPipeline(camera, state, cameraUrl);
+    return;
+  }
+
+  // ── 1. Initial frame grab (3 frames) + YOLO ─────────────────────────────
   let frames = [];
+  const fireModelFiles = getFireModelFiles(aiType);
   try {
-    frames = await detectFireMultiFrame(cameraUrl, camera.name, FRAMES_PER_CYCLE, { modelFile: "best.onnx" });
+    frames = await detectFireMultiModelFrame(cameraUrl, camera.name, FRAMES_PER_CYCLE, fireModelFiles);
     const readErr = frames.find(f => f.transientReadError || f.error);
     if (readErr) {
       log.warn({ id: camera.id, error: readErr.error }, "⚠️ Frame read error — skipping cycle");
@@ -370,10 +722,9 @@ async function processCameraOnce(camera) {
 
   const initialFireFrames = frames.filter(f => f.isFire && f.boxes?.length > 0);
 
-  // Behavioral + weapon always run every cycle regardless of fire state.
-  // All three pipelines (fire, behavioral, weapon) are fully independent.
-  const behavioralPromise = runBehavioralPipeline(frames, camera, state, cameraUrl);
-  const weaponPromise     = runWeaponPipeline(camera, state, cameraUrl);
+  // Fire mode only: behavioral and weapon pipelines run in their own aiType modes.
+  const behavioralPromise = Promise.resolve();
+  const weaponPromise     = Promise.resolve();
 
   if (initialFireFrames.length === 0) {
     // ── No fire ──────────────────────────────────────────────────────────────
@@ -408,38 +759,65 @@ async function processCameraOnce(camera) {
     return;
   }
 
-  // ── 2. Multi-check: 2 immediate quick rechecks ────────────────────────────
-  // The same full check repeats 2 more times right away.
+  // ── 2. Multi-check: 2 immediate quick rechecks (run in parallel) ─────────
   // Need 2/3 to confirm — OR ByteTracker shows significant bbox movement.
   let checksConfirmed = 1; // initial check passed
   const recheckFrames = [];
 
-  for (let i = 0; i < RECHECK_COUNT; i++) {
-    try {
-      const quick = await detectFireMultiFrame(cameraUrl, camera.name, 1, { modelFile: "best.onnx" });
-      const qf = quick[0];
-      if (qf && !qf.transientReadError) {
-        tracker.update(qf.boxes || []);
-        recheckFrames.push(qf);
-        if (qf.isFire && qf.boxes?.length > 0) checksConfirmed++;
-      }
-    } catch {}
+  const recheckResults = await Promise.allSettled(
+    Array.from({ length: RECHECK_COUNT }, () =>
+      detectFireMultiModelFrame(cameraUrl, camera.name, 1, fireModelFiles)
+    )
+  );
+  for (const r of recheckResults) {
+    if (r.status !== "fulfilled") continue;
+    const qf = r.value[0];
+    if (qf && !qf.transientReadError) {
+      tracker.update(qf.boxes || []);
+      recheckFrames.push(qf);
+      if (qf.isFire && qf.boxes?.length > 0) checksConfirmed++;
+    }
   }
 
-  // ByteTracker significant bbox movement (real fire moves; static photo doesn't)
+  // ── Layer 1: Bbox stability across ALL consecutive frame pairs ───────────────
+  // Compare every consecutive pair in allDetected, not just first vs last.
+  // Real fire: at least one pair has IoU < BBOX_STABLE_IOU_THRESH (flames shift).
+  // Static image: every pair is nearly identical (YOLO variance only) → bboxStable = true.
   const allDetected = [...initialFireFrames, ...recheckFrames.filter(f => f.isFire && f.boxes?.length > 0)];
-  let bboxMoved = false;
+  let bboxStable = true;
+  let bboxMoved  = false; // first-vs-last IoU movement signal
   if (allDetected.length >= 2) {
-    const iou = computeIoU(allDetected[0].boxes[0], allDetected[allDetected.length - 1].boxes[0]);
-    bboxMoved = iou < BOX_MOVE_IOU_THRESHOLD;
+    const firstLastIoU = computeIoU(allDetected[0].boxes[0], allDetected[allDetected.length - 1].boxes[0]);
+    bboxMoved = firstLastIoU < BOX_MOVE_IOU_THRESHOLD;
+    // Check every consecutive pair for the strict stability signal
+    for (let i = 0; i < allDetected.length - 1; i++) {
+      if (computeIoU(allDetected[i].boxes[0], allDetected[i + 1].boxes[0]) < BBOX_STABLE_IOU_THRESH) {
+        bboxStable = false; break;
+      }
+    }
   }
 
-  const confirmedTracks   = tracker.getConfirmedTracks();
-  const multiCheckPassed  = checksConfirmed >= CONFIRM_THRESHOLD || bboxMoved;
+  // Normalized bbox-center displacement (first → last frame), relative to bbox diagonal.
+  // Quantifies how far the fire region moved across the cycle, independent of IoU.
+  let centerDisplacement = 0;
+  if (allDetected.length >= 2) {
+    const f0 = allDetected[0].boxes[0], fN = allDetected[allDetected.length - 1].boxes[0];
+    const cx1 = (f0[0] + f0[2]) / 2, cy1 = (f0[1] + f0[3]) / 2;
+    const cx2 = (fN[0] + fN[2]) / 2, cy2 = (fN[1] + fN[3]) / 2;
+    const avgW = ((f0[2] - f0[0]) + (fN[2] - fN[0])) / 2;
+    const avgH = ((f0[3] - f0[1]) + (fN[3] - fN[1])) / 2;
+    const diag = Math.sqrt(avgW * avgW + avgH * avgH) || 1;
+    centerDisplacement = Math.sqrt((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2) / diag;
+  }
+
+  const confirmedTracks  = tracker.getConfirmedTracks();
+  const inStaticCooldown = (state.staticRejectedUntil ?? 0) > Date.now();
+  const multiCheckPassed = checksConfirmed >= CONFIRM_THRESHOLD || bboxMoved;
 
   log.info({
-    id: camera.id, checksConfirmed, bboxMoved,
-    confirmedTracks: confirmedTracks.length, passed: multiCheckPassed,
+    id: camera.id, checksConfirmed, bboxMoved, bboxStable,
+    centerDisp: centerDisplacement.toFixed(4),
+    confirmedTracks: confirmedTracks.length, passed: multiCheckPassed, inStaticCooldown,
   }, "🔍 Multi-check");
 
   if (!multiCheckPassed) {
@@ -456,58 +834,70 @@ async function processCameraOnce(camera) {
     return;
   }
 
-  // ── 3. Fast pixel-motion check (bypass CLIP if strong motion already seen) ─
+  // ── Layer 2: Pixel liveness in fire crop region ───────────────────────────
+  // isFireMoving crops the fire bbox from all frames and measures per-pixel change.
+  // Phone screens:   0.05-0.14 (subtle frame-to-frame variation)
+  // Real fire:       0.20-0.50+ (flames visibly flicker)
+  // Static photo:    0.00-0.05 (near-zero change)
+  // Strong local motion is enough to restore an active fire immediately.
+  // Static/paused fire stays near zero and still goes through the static checks.
   let pixelMotion = 0;
   try {
     const bufs = allDetected.filter(f => f.frameBuffer).map(f => f.frameBuffer);
     const boxs = allDetected.filter(f => f.frameBuffer).map(f => f.boxes[0]);
-    if (bufs.length >= 2) pixelMotion = await livenessValidator.isFireMoving(bufs, boxs);
+    if (bufs.length >= 3) pixelMotion = await livenessValidator.isFireMoving(bufs, boxs);
   } catch {}
 
-  // ── 4. JEPA + CLIP verification: real fire vs static image/screen ──────────
-  let verification;
-  if (pixelMotion > FIRE_MOTION_THRESHOLD) {
-    log.info({ id: camera.id, pixelMotion }, "🔥 Strong pixel motion — CLIP verification skipped");
-    verification = { isReal: true, alertType: "Fire" };
-  } else {
-    verification = await verifyFireWithClip(allDetected, camera.id);
+  let interCycleRatio = 0;
+  const curFrame = allDetected[allDetected.length - 1];
+  if (state.lastCycleFrame && curFrame?.frameBuffer && curFrame?.boxes?.[0]) {
+    try {
+      interCycleRatio = await livenessValidator.compareInterCycle(
+        state.lastCycleFrame, curFrame.frameBuffer, curFrame.boxes[0]
+      );
+    } catch {}
+  }
+  if (curFrame?.frameBuffer) {
+    state.lastCycleFrame = curFrame.frameBuffer;
+    state.lastCycleBox   = curFrame.boxes?.[0];
   }
 
-  // Inter-cycle comparison catches static objects that persist across cycles
-  {
-    const curFrame = allDetected[allDetected.length - 1];
-    let interCycleRatio = 0;
-    if (state.lastCycleFrame && curFrame?.frameBuffer && curFrame?.boxes?.[0]) {
-      try {
-        interCycleRatio = await livenessValidator.compareInterCycle(
-          state.lastCycleFrame, curFrame.frameBuffer, curFrame.boxes[0]
-        );
-      } catch {}
-    }
-    if (curFrame?.frameBuffer) { state.lastCycleFrame = curFrame.frameBuffer; state.lastCycleBox = curFrame.boxes?.[0]; }
+  const interCycleMotion = interCycleRatio > INTER_CYCLE_THRESHOLD;
 
-    // Only reject as static object when CLIP is NOT already confident about fire/smoke.
-    // High-res streams can return near-identical frames across 3s windows even for real fire,
-    // so inter-cycle diff=0 is unreliable when CLIP has already verified the scene.
-    const clipConfident = verification.isReal && (verification.alertType === "Fire" || verification.alertType === "Smoke")
-      && verification.reason !== "verification_error";
-    if (verification.isReal && state.confirmedCycles >= 3 && interCycleRatio === 0 && !clipConfident) {
-      log.warn({ id: camera.id, confirmedCycles: state.confirmedCycles }, "🚫 Zero inter-cycle change — static object");
-      verification = { isReal: false, reason: "inter_cycle_static" };
-    } else if (verification.isReal && state.confirmedCycles >= 3 && interCycleRatio === 0 && clipConfident) {
-      log.info({ id: camera.id, confirmedCycles: state.confirmedCycles, alertType: verification.alertType }, "✅ Inter-cycle diff=0 but CLIP confirmed — trusting CLIP");
-    } else if (interCycleRatio > INTER_CYCLE_THRESHOLD) {
-      // Override CLIP if inter-cycle motion is unambiguous
-      verification.isReal   = true;
-      verification.reason   = "inter_cycle_confirmed";
-    }
+  // Fire liveness is intentionally simple and fast:
+  // YOLO fire + motion = active fire. YOLO fire + no motion = static fire image/video.
+  // V-JEPA/CLIP are not used here because fire alerts must recover immediately when motion resumes.
+  const hasMotion = pixelMotion >= PIXEL_MOTION_REAL_THRESH || interCycleMotion;
+  const verification = hasMotion
+    ? {
+        isReal: true,
+        alertType: "Fire",
+        reason: pixelMotion >= PIXEL_MOTION_REAL_THRESH ? "pixel_motion_confirmed" : "inter_cycle_confirmed",
+      }
+    : { isReal: false, reason: "multi_static_signal" };
+
+  log.info({
+    id: camera.id,
+    decision: verification.isReal ? "active_fire" : "static_fire",
+    reason: verification.reason,
+    pixelMotion: pixelMotion.toFixed(4),
+    interCycleRatio: interCycleRatio.toFixed(4),
+    bboxStable,
+    centerDisplacement: centerDisplacement.toFixed(4),
+  }, "🔥 Fire motion decision");
+
+  if (verification.isReal) {
+    state.staticRejectedUntil = 0;
   }
 
   if (!verification.isReal) {
     log.warn({ id: camera.id, reason: verification.reason }, "🚫 Fire rejected");
-    if (state.isFire && broadcastFireDetection) {
+    if (STATIC_REJECT_REASONS.has(verification.reason)) {
+      state.staticRejectedUntil = 0;
+      log.info({ id: camera.id, reason: verification.reason }, "🖼️ Static fire detected — waiting for motion");
+    }
+    if (broadcastFireDetection && (state.isFire || STATIC_REJECT_REASONS.has(verification.reason))) {
       broadcastFireDetection(camera.userId, camera.id, camera.name, false, {
-        event: state.lastAlertType === "Smoke" ? "Smoke Disappeared" : "Fire Disappeared",
         reason: verification.reason,
       });
     }
@@ -524,7 +914,7 @@ async function processCameraOnce(camera) {
   state.lastAlertType   = alertType;
 
   const bestFrame      = pickBestFrame(allDetected);
-  const broadcastBoxes = allDetected.flatMap(f => f.boxes || []).slice(0, 10);
+  const broadcastBoxes = bestFrame?.boxes || [];
   const detectionEvent = !wasFireBefore
     ? (alertType === "Smoke" ? "Smoke is spreading through the area" : "Active fire detected in the scene")
     : null;
@@ -538,20 +928,38 @@ async function processCameraOnce(camera) {
     });
   }
 
-  // SNS + S3 (rate-limited)
+  // SNS + optional S3 image (rate-limited). SNS must not depend on S3 success.
   const now       = Date.now();
   const lastAlert = lastAlertSent.get(camera.id) || 0;
-  if (now - lastAlert > ALERT_COOLDOWN_MS && bestFrame?.frameBuffer) {
-    lastAlertSent.set(camera.id, now);
-    try {
-      const imageUrl = await uploadFireFrame(camera.id, bestFrame.frameBuffer, broadcastBoxes);
-      await sendFireAlert(camera.userId, camera.id, camera.name, {
-        isFire: true, detectionType: alertType, confidence: bestFrame.confidence,
-      }, imageUrl);
-      log.info("✅ SNS alert sent");
-    } catch (err) {
-      log.error({ err: err.message }, "❌ SNS/S3 alert failed");
+  if (now - lastAlert > ALERT_COOLDOWN_MS) {
+    let imageUrl = null;
+    if (bestFrame?.frameBuffer) {
+      try {
+        imageUrl = await uploadFireFrame(camera.id, bestFrame.frameBuffer, broadcastBoxes);
+      } catch (err) {
+        log.error({ id: camera.id, err: err.message }, "❌ S3 upload failed — sending SNS without image");
+      }
+    } else {
+      log.warn({ id: camera.id }, "⚠️ No best frame available — sending SNS without image");
     }
+
+    try {
+      await sendFireAlert(camera.userId, camera.id, camera.name, {
+        isFire: true,
+        detectionType: alertType,
+        confidence: bestFrame?.confidence,
+        boxes: broadcastBoxes,
+      }, imageUrl);
+      lastAlertSent.set(camera.id, now);
+      log.info({ id: camera.id, alertType, imageAttached: !!imageUrl }, "✅ SNS alert sent");
+    } catch (err) {
+      log.error({ id: camera.id, err: err.message }, "❌ SNS alert failed");
+    }
+  } else {
+    log.info({
+      id: camera.id,
+      remainingMs: ALERT_COOLDOWN_MS - (now - lastAlert),
+    }, "⏳ SNS alert skipped by cooldown");
   }
 
   await Promise.all([behavioralPromise, weaponPromise]);
@@ -577,7 +985,7 @@ function startCameraLoop(camera) {
       }
       if (loop.active && isRunning) await sleep(CYCLE_INTERVAL_MS);
     }
-    cameraLoops.delete(id);
+    if (cameraLoops.get(id) === loop) cameraLoops.delete(id);
     log.info({ id }, "⏹ Camera loop stopped");
   })();
 
@@ -601,7 +1009,10 @@ function startCameraLoop(camera) {
 
 function stopCameraLoop(cameraId) {
   const loop = cameraLoops.get(cameraId);
-  if (loop) loop.active = false;
+  if (loop) {
+    loop.active = false;
+    cameraLoops.delete(cameraId); // delete immediately so startCameraLoop can restart on re-add
+  }
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────

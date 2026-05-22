@@ -31,7 +31,11 @@ if (!fs.existsSync(MODELS_DIR)) {
 // All models the app needs — S3 key → fallback public URL
 const REQUIRED_MODELS = {
     "best.onnx":                    { fallback: null },
+    "best_s.onnx":                  { fallback: null },
     "weapons.onnx":                 { fallback: null },
+    "weapons_yolo.onnx":            { fallback: null },
+    "knife_yolov8n.onnx":           { fallback: null },
+    "mask_yolov5.onnx":             { fallback: null },
     "depth_anything_v2_small.onnx": { fallback: null },
     "yolov8n.onnx":                 { fallback: "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.onnx" },
     "yolov8n-pose.onnx":            { fallback: "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n-pose.onnx" },

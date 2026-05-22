@@ -2,7 +2,7 @@ import {
   SNSClient,
   SubscribeCommand,
 } from "@aws-sdk/client-sns";
-import pino from "pino";
+import { makeLogger } from "../src/logger.js";
 import dotenv from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -12,7 +12,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 dotenv.config({ path: join(__dirname, "..", ".env") });
 
-const log = pino({ name: "sns-subscribe" });
+const log = makeLogger("sns-subscribe");
 
 const snsClient = new SNSClient({
   region: process.env.AWS_REGION || "us-east-1",

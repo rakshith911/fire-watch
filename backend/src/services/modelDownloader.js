@@ -6,9 +6,9 @@ import http from "http";
 import fs from "fs";
 import path from "path";
 import { pipeline } from "stream/promises";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 
-const log = pino({ name: "model-downloader" });
+const log = makeLogger("model-downloader");
 
 const s3 = new S3Client({
   region: process.env.AWS_REGION || "us-east-1",

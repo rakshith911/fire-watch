@@ -1,12 +1,13 @@
 import * as ort from "onnxruntime-node";
 import sharp from "sharp";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 import path from "path";
 import { fileURLToPath } from "url";
 import { grabFrameOnce, grabMultipleFrames } from "./localDetector.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const log = pino({ name: "local-weapon-detector" });
+const log = makeLogger("local-weapon-detector");
+const THREAT_LABELS = ["Gun", "explosion", "grenade", "knife"];
 
 // -------------------------------------------------------------------
 // 🎯 ONNX Session Management (Singleton)
@@ -129,7 +130,7 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
 
     const numQueries = 300;
     const stride = 6;  // RT-DETR format: [x1, y1, x2, y2, conf, class_id]
-    const probThreshold = 0.35;  // LOW threshold to pass candidates to detectionQueue. Logic there handles strict/consistency checks.
+    const probThreshold = 0.50;
 
     // Verify data length
     const expectedLength = numQueries * stride;
@@ -162,10 +163,11 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
         });
     }
     allScores.sort((a, b) => b.score - a.score);
+    const isSingleClassOutput = allScores.every(s => s.class === 0);
 
     const top5 = allScores.slice(0, 5).map(s => ({
         score: s.score.toFixed(4),
-        label: s.class === 0 ? "Knife" : `Ignored(${s.class})`,
+        label: isSingleClassOutput && s.class === 0 ? "knife" : THREAT_LABELS[s.class] || `Unknown(${s.class})`,
         box: s.rawBox  // {cx, cy, w, h} normalized
     }));
     log.info({ top5, letterbox: { scale, padX, padY } }, "🔫 WEAPON: Top 5 Scores (cx,cy,w,h normalized)");
@@ -182,8 +184,9 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
         const confidence = combined[offset + 4];
         const classId = Math.round(combined[offset + 5]);
 
+        const classLabel = isSingleClassOutput && classId === 0 ? "knife" : THREAT_LABELS[classId];
         if (confidence < probThreshold) continue;
-        if (classId !== 0) continue; // Only Knife is considered a weapon in this app flow.
+        if (classLabel !== "knife") continue; // Only knife is considered a weapon in this app flow.
 
         // Convert normalized center format to corner format in 640x640 space
         const x1_640 = (cx - w / 2) * 640;

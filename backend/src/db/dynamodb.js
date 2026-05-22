@@ -1,8 +1,8 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, DeleteCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 
-const log = pino({ name: "dynamodb" });
+const log = makeLogger("dynamodb");
 
 // Create DynamoDB client
 const client = new DynamoDBClient({

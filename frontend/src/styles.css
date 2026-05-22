@@ -2262,7 +2262,7 @@ body {
 
 .modern-table-header {
   display: grid;
-  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.8fr;
+  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.9fr 0.8fr;
   /* Name, Location, IP, Port, Username, Password, StreamPath, View, Stream, Actions */
   gap: 10px;
   padding: 16px 20px;
@@ -2290,7 +2290,7 @@ body {
 
 .modern-table-row {
   display: grid;
-  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.8fr;
+  grid-template-columns: 1fr 0.8fr 0.9fr 0.5fr 0.7fr 0.7fr 0.8fr 0.5fr 0.5fr 0.9fr 0.8fr;
   /* Name, Location, IP, Port, Username, Password, StreamPath, View, Stream, Actions */
   gap: 10px;
   padding: 18px 20px;
@@ -3425,6 +3425,39 @@ body {
 
 .detection-updating {
   font-size: 14px;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.aitype-select-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.aitype-select {
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 13px;
+  transition: all 0.2s;
+  width: 100%;
+  font-family: inherit;
+}
+
+.aitype-select:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--accent-color);
+}
+
+.aitype-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.aitype-select.updating {
   animation: pulse 1.5s ease-in-out infinite;
 }
 

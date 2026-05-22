@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 import { cfg } from "../config.js";
 
-const log = pino({ name: "stream-manager" });
+const log = makeLogger("stream-manager");
 const activeStreams = new Map();
 
 // -------------------------------------------------------------------

@@ -13,17 +13,19 @@ import {
   sanitizePathName,
 } from "../services/mediamtxConfigGenerator.js";
 import { startMediaMTX, stopMediaMTX } from "../services/mediamtx.js";
+import { makeLogger } from "../logger.js";
 
 export const cameras = Router();
+const log = makeLogger("camera-routes");
 
 async function restartMediaMTXForUser(userId, reason) {
   try {
-    console.log(`🔄 Regenerating MediaMTX config ${reason}...`);
+    log.info({ userId, reason }, "Regenerating MediaMTX config");
     await stopMediaMTX();
     await startMediaMTX(userId);
-    console.log("✅ MediaMTX restarted with updated camera config");
+    log.info({ userId, reason }, "MediaMTX restarted with updated camera config");
   } catch (err) {
-    console.error("❌ Failed to restart MediaMTX:", err.message);
+    log.error({ userId, reason, err: err.message }, "Failed to restart MediaMTX");
   }
 }
 
@@ -56,7 +58,7 @@ cameras.post("/", async (req, res) => {
     if (cfg.backendDetectionEnabled && cam.isActive) {
       cam.userId = userId;
       addCameraToQueue(cam);
-      console.log(`✅ Added ${cam.name} to detection queue`);
+      log.info({ userId, cameraId: cam.id, cameraName: cam.name }, "Added camera to detection queue");
     }
 
     res.json(cam);
@@ -141,7 +143,7 @@ cameras.post("/start-detection", async (req, res) => {
       return res.status(400).json({ error: "No valid camera IDs provided" });
     }
 
-    console.log("▶️ Starting detection for IDs:", ids);
+    log.info({ userId, ids }, "Starting detection");
 
     const cameraList = await dynamodb.getCamerasByIds(userId, ids);
 
@@ -159,13 +161,13 @@ cameras.post("/start-detection", async (req, res) => {
         if (cfg.backendDetectionEnabled) {
           cam.userId = userId;
           addCameraToQueue(cam);
-          console.log(`▶️ Started detection for ${cam.name} (id: ${cam.id})`);
+          log.info({ userId, cameraId: cam.id, cameraName: cam.name }, "Started detection for camera");
         } else {
-          console.log(`⏸️ Marked ${cam.name} active; backend detection is disabled`);
+          log.info({ userId, cameraId: cam.id, cameraName: cam.name }, "Marked camera active; backend detection is disabled");
         }
         started.push({ id: cam.id, name: cam.name });
       } catch (error) {
-        console.error(`❌ Failed to start ${cam.name}:`, error.message);
+        log.error({ userId, cameraId: cam.id, cameraName: cam.name, err: error.message }, "Failed to start camera");
         failed.push({ id: cam.id, name: cam.name, error: error.message });
       }
     }
@@ -178,7 +180,7 @@ cameras.post("/start-detection", async (req, res) => {
         : `Marked ${started.length} camera(s) active; backend detection is disabled`,
     });
   } catch (error) {
-    console.error("❌ Start detection error:", error);
+    log.error({ err: error.message, stack: error.stack }, "Start detection error");
     res.status(500).json({ error: error.message });
   }
 });
@@ -201,7 +203,7 @@ cameras.post("/stop-detection", async (req, res) => {
       return res.status(400).json({ error: "No valid camera IDs provided" });
     }
 
-    console.log("🛑 Stopping detection for IDs:", ids);
+    log.info({ userId, ids }, "Stopping detection");
 
     const cameraList = await dynamodb.getCamerasByIds(userId, ids);
 
@@ -214,9 +216,9 @@ cameras.post("/stop-detection", async (req, res) => {
 
         removeCameraFromQueue(cam.id);
         stopped.push({ id: cam.id, name: cam.name });
-        console.log(`⏸️ Stopped detection for ${cam.name} (id: ${cam.id})`);
+        log.info({ userId, cameraId: cam.id, cameraName: cam.name }, "Stopped detection for camera");
       } catch (error) {
-        console.error(`❌ Failed to stop ${cam.name}:`, error.message);
+        log.error({ userId, cameraId: cam.id, cameraName: cam.name, err: error.message }, "Failed to stop camera");
         failed.push({ id: cam.id, name: cam.name, error: error.message });
       }
     }
@@ -227,7 +229,7 @@ cameras.post("/stop-detection", async (req, res) => {
       message: `Stopped detection for ${stopped.length} camera(s)`,
     });
   } catch (error) {
-    console.error("❌ Stop detection error:", error);
+    log.error({ err: error.message, stack: error.stack }, "Stop detection error");
     res.status(500).json({ error: error.message });
   }
 });
@@ -260,12 +262,12 @@ cameras.put("/:id", async (req, res) => {
     if (req.body.aiType) {
       const validAiTypes = [
         "FIRE",
-        "FIRE_SMALL",
         "FIRE_YOLO",
         "FIRE_DETECTRON",
         "WEAPON",
         "WEAPON_YOLO",
         "WEAPON_DETECTRON",
+        "MASK",
         "BOTH",
         "BOTH_DETECTRON",
       ];
@@ -300,9 +302,13 @@ cameras.put("/:id", async (req, res) => {
         removeCameraFromQueue(cam.id);
         cam.userId = userId;
         addCameraToQueue(cam);
-        console.log(
-          `✅ Restarted ${cam.name} - aiType changed from ${currentCam.aiType} to ${cam.aiType}`
-        );
+        log.info({
+          userId,
+          cameraId: cam.id,
+          cameraName: cam.name,
+          fromAiType: currentCam.aiType,
+          toAiType: cam.aiType,
+        }, "Restarted camera after aiType change");
       }
     } else if (cfg.backendDetectionEnabled && cam.isActive) {
       // Update non-aiType changes only when the camera is actually active.

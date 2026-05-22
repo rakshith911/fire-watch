@@ -64,238 +64,170 @@ function Dashboard() {
 
   return (
     <div className="shell">
-      <main className="main">
-        {currentPage === "video" ? (
-          <>
-            <header className="toolbar">
-              <div className="toolbar-brand">
-                <img
-                  src="./fire_ai_logo.png"
-                  alt="FireWatch Logo"
-                  className="toolbar-logo"
+      {/*
+        The video main is ALWAYS mounted so CameraTile's useEffect never
+        runs its cleanup (which closes the PeerConnection). We hide it with
+        display:none when the user navigates to the Status page — the cameras
+        stay alive in the background.
+      */}
+      <main
+        className="main"
+        style={{ display: currentPage === "video" ? undefined : "none" }}
+      >
+        <header className="toolbar">
+          <div className="toolbar-brand">
+            <img
+              src="./fire_ai_logo.png"
+              alt="FireWatch Logo"
+              className="toolbar-logo"
+            />
+            <img
+              src="./fire_ai_text.png"
+              alt="FireWatch"
+              className="toolbar-text"
+            />
+          </div>
+
+          <nav className="toolbar-nav">
+            <button
+              className={`nav-btn ${currentPage === "video" ? "active" : ""}`}
+              onClick={() => handleNavigate("video")}
+            >
+              Streams
+            </button>
+            <button
+              className={`nav-btn ${currentPage === "status" ? "active" : ""}`}
+              onClick={() => handleNavigate("status")}
+            >
+              Status
+            </button>
+          </nav>
+
+          <div className="toolbar-controls">
+            <button
+              className="theme-toggle"
+              onClick={onToggleTheme}
+              aria-label="Toggle theme"
+            >
+              {theme === "dark" ? "🌙" : "☀️"}
+            </button>
+
+            <div className="signout-wrapper">
+              <button onClick={logout}>Sign out</button>
+              <span className="version-text">v{appVersion}</span>
+            </div>
+          </div>
+        </header>
+
+        <div
+          className={`secondary-toolbar ${isSecondaryToolbarExiting ? "exiting" : ""}`}
+        >
+          <div className="view-controls">
+            <button
+              className={`view-btn ${viewMode === "single" ? "active" : ""}`}
+              onClick={() => handleViewModeChange("single")}
+              title="Single View"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="3" y="3" width="18" height="18" rx="2" stroke="currentColor" strokeWidth="2" fill="none" />
+              </svg>
+              <span>Single</span>
+            </button>
+            <button
+              className={`view-btn ${viewMode === "grid" ? "active" : ""}`}
+              onClick={() => handleViewModeChange("grid")}
+              title="Grid View"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="3" y="3" width="7" height="7" rx="1" stroke="currentColor" strokeWidth="2" fill="none" />
+                <rect x="14" y="3" width="7" height="7" rx="1" stroke="currentColor" strokeWidth="2" fill="none" />
+                <rect x="3" y="14" width="7" height="7" rx="1" stroke="currentColor" strokeWidth="2" fill="none" />
+                <rect x="14" y="14" width="7" height="7" rx="1" stroke="currentColor" strokeWidth="2" fill="none" />
+              </svg>
+              <span>Grid</span>
+            </button>
+            <button
+              className={`view-btn ${showStatusPanel ? "active" : ""}`}
+              onClick={() => setShowStatusPanel(!showStatusPanel)}
+              title="Toggle Status Panel"
+            >
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M3 3h18v2H3V3zm0 4h18v2H3V7zm0 4h18v2H3v-2zm0 4h18v2H3v-2zm0 4h18v2H3v-2z" />
+              </svg>
+              <span>Status Panel</span>
+            </button>
+
+            <div className="toggle-wrapper" title="Toggle Bounding Boxes">
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={showBoundingBoxes}
+                  onChange={(e) => setShowBoundingBoxes(e.target.checked)}
                 />
-                <img
-                  src="./fire_ai_text.png"
-                  alt="FireWatch"
-                  className="toolbar-text"
-                />
-              </div>
+                <span className="slider"></span>
+              </label>
+              <span className="toggle-label" onClick={() => setShowBoundingBoxes(!showBoundingBoxes)}>Boxes</span>
+            </div>
 
-              <nav className="toolbar-nav">
-                <button
-                  className={`nav-btn ${currentPage === "video" ? "active" : ""
-                    }`}
-                  onClick={() => handleNavigate("video")}
-                >
-                  Streams
-                </button>
-                <button
-                  className={`nav-btn ${currentPage === "status" ? "active" : ""
-                    }`}
-                  onClick={() => handleNavigate("status")}
-                >
-                  Status
-                </button>
-              </nav>
-
-              <div className="toolbar-controls">
-                <button
-                  className="theme-toggle"
-                  onClick={onToggleTheme}
-                  aria-label="Toggle theme"
-                >
-                  {theme === "dark" ? "🌙" : "☀️"}
-                </button>
-
-                <div className="signout-wrapper">
-                  <button onClick={logout}>Sign out</button>
-                  <span className="version-text">v{appVersion}</span>
-                </div>
-              </div>
-            </header>
-
-            {/* Secondary Toolbar - Only visible on Streams tab */}
-            {currentPage === "video" && (
-              <div
-                className={`secondary-toolbar ${isSecondaryToolbarExiting ? "exiting" : ""
-                  }`}
+            <div className="add-camera-container">
+              <button
+                className={`view-btn ${showAdd ? "active" : ""}`}
+                onClick={() => setShowAdd(!showAdd)}
+                title="Add Camera"
               >
-                <div className="view-controls">
-                  <button
-                    className={`view-btn ${viewMode === "single" ? "active" : ""
-                      }`}
-                    onClick={() => handleViewModeChange("single")}
-                    title="Single View"
-                  >
-                    <svg
-                      width="24"
-                      height="24"
-                      viewBox="0 0 24 24"
-                      fill="currentColor"
-                    >
-                      <rect
-                        x="3"
-                        y="3"
-                        width="18"
-                        height="18"
-                        rx="2"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        fill="none"
-                      />
-                    </svg>
-                    <span>Single</span>
-                  </button>
-                  <button
-                    className={`view-btn ${viewMode === "grid" ? "active" : ""
-                      }`}
-                    onClick={() => handleViewModeChange("grid")}
-                    title="Grid View"
-                  >
-                    <svg
-                      width="24"
-                      height="24"
-                      viewBox="0 0 24 24"
-                      fill="currentColor"
-                    >
-                      <rect
-                        x="3"
-                        y="3"
-                        width="7"
-                        height="7"
-                        rx="1"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        fill="none"
-                      />
-                      <rect
-                        x="14"
-                        y="3"
-                        width="7"
-                        height="7"
-                        rx="1"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        fill="none"
-                      />
-                      <rect
-                        x="3"
-                        y="14"
-                        width="7"
-                        height="7"
-                        rx="1"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        fill="none"
-                      />
-                      <rect
-                        x="14"
-                        y="14"
-                        width="7"
-                        height="7"
-                        rx="1"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        fill="none"
-                      />
-                    </svg>
-                    <span>Grid</span>
-                  </button>
-                  <button
-                    className={`view-btn ${showStatusPanel ? "active" : ""}`}
-                    onClick={() => setShowStatusPanel(!showStatusPanel)}
-                    title="Toggle Status Panel"
-                  >
-                    <svg
-                      width="24"
-                      height="24"
-                      viewBox="0 0 24 24"
-                      fill="currentColor"
-                    >
-                      <path d="M3 3h18v2H3V3zm0 4h18v2H3V7zm0 4h18v2H3v-2zm0 4h18v2H3v-2zm0 4h18v2H3v-2z" />
-                    </svg>
-                    <span>Status Panel</span>
-                  </button>
-
-                  <div className="toggle-wrapper" title="Toggle Bounding Boxes">
-                    <label className="toggle-switch">
-                      <input
-                        type="checkbox"
-                        checked={showBoundingBoxes}
-                        onChange={(e) => setShowBoundingBoxes(e.target.checked)}
-                      />
-                      <span className="slider"></span>
-                    </label>
-                    <span className="toggle-label" onClick={() => setShowBoundingBoxes(!showBoundingBoxes)}>Boxes</span>
-                  </div>
-
-                  <div className="add-camera-container">
-                    <button
-                      className={`view-btn ${showAdd ? "active" : ""}`}
-                      onClick={() => setShowAdd(!showAdd)}
-                      title="Add Camera"
-                    >
-                      <svg
-                        width="24"
-                        height="24"
-                        viewBox="0 0 24 24"
-                        fill="currentColor"
-                      >
-                        <path d="M4 4h3l2-2h6l2 2h3c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2zm8 3c-2.8 0-5 2.2-5 5s2.2 5 5 5 5-2.2 5-5-2.2-5-5-5zm0 8c-1.7 0-3-1.3-3-3s1.3-3 3-3 3 1.3 3 3-1.3 3-3 3z" />
-                      </svg>
-                      <span>Add Camera</span>
-                    </button>
-                    {showAdd && (
-                      <div className="add-camera-form">
-                        <AddCameraDialog onClose={() => setShowAdd(false)} />
-                      </div>
-                    )}
-                  </div>
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M4 4h3l2-2h6l2 2h3c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2zm8 3c-2.8 0-5 2.2-5 5s2.2 5 5 5 5-2.2 5-5-2.2-5-5-5zm0 8c-1.7 0-3-1.3-3-3s1.3-3 3-3 3 1.3 3 3-1.3 3-3 3z" />
+                </svg>
+                <span>Add Camera</span>
+              </button>
+              {showAdd && (
+                <div className="add-camera-form">
+                  <AddCameraDialog onClose={() => setShowAdd(false)} />
                 </div>
-              </div>
-            )}
+              )}
+            </div>
+          </div>
+        </div>
 
-            {currentPage === "video" ? (
-              <section
-                className={`content ${viewMode === "single"
-                  ? showStatusPanel || isExiting
-                    ? "content--single-with-status"
-                    : "content--single"
-                  : showStatusPanel || isExiting
-                    ? "content--with-status"
-                    : "content--grid"
-                  }`}
-              >
-                {viewMode === "single" ? (
-                  <SingleCameraView
-                    selectedCameraIndex={selectedCameraIndex}
-                    onCameraChange={handleCameraChange}
-                  />
-                ) : (
-                  <CameraGrid />
-                )}
-                <CSSTransition
-                  in={showStatusPanel}
-                  timeout={300}
-                  classNames="status-panel"
-                  unmountOnExit
-                  nodeRef={statusPanelRef}
-                  onExit={() => setIsExiting(true)}
-                  onExited={() => setIsExiting(false)}
-                >
-                  <div ref={statusPanelRef}>
-                    <MiniStatusPanel viewMode={viewMode} />
-                  </div>
-                </CSSTransition>
-              </section>
-            ) : (
-              <Status onNavigate={handleNavigate} currentPage={currentPage} />
-            )}
-          </>
-        ) : (
-          <Status onNavigate={handleNavigate} currentPage={currentPage} />
-        )}
+        <section
+          className={`content ${
+            viewMode === "single"
+              ? showStatusPanel || isExiting
+                ? "content--single-with-status"
+                : "content--single"
+              : showStatusPanel || isExiting
+                ? "content--with-status"
+                : "content--grid"
+          }`}
+        >
+          {viewMode === "single" ? (
+            <SingleCameraView
+              selectedCameraIndex={selectedCameraIndex}
+              onCameraChange={handleCameraChange}
+            />
+          ) : (
+            <CameraGrid />
+          )}
+          <CSSTransition
+            in={showStatusPanel}
+            timeout={300}
+            classNames="status-panel"
+            unmountOnExit
+            nodeRef={statusPanelRef}
+            onExit={() => setIsExiting(true)}
+            onExited={() => setIsExiting(false)}
+          >
+            <div ref={statusPanelRef}>
+              <MiniStatusPanel viewMode={viewMode} />
+            </div>
+          </CSSTransition>
+        </section>
       </main>
+
+      {/* Status page renders its own shell/main/header as a sibling */}
+      {currentPage === "status" && (
+        <Status onNavigate={handleNavigate} currentPage={currentPage} />
+      )}
     </div>
   );
 }

@@ -4,14 +4,13 @@ const WINDOW_MS = 5 * 60 * 1000; // 5-minute rolling window
 const TICK_COUNT = 6; // time axis ticks (0:00 … 5:00)
 
 const CATEGORIES = [
-  { key: "fire",     label: "Fire/Smoke", threats: ["smoke", "small_fire", "large_fire", "fire"] },
+  { key: "fire",     label: "Fire/Smoke", threats: ["smoke", "large_fire", "fire"] },
   { key: "weapon",   label: "Weapon",     threats: ["weapon", "weapon_threat"] },
   { key: "behavior", label: "Behavior",   threats: ["face_covered", "loitering"] },
 ];
 
 const THREAT_COLOR = {
   smoke:        "#ffb86c",
-  small_fire:   "#f97316",
   large_fire:   "#ff5555",
   fire:         "#f97316",
   weapon:       "#8be9fd",
@@ -22,7 +21,6 @@ const THREAT_COLOR = {
 
 const THREAT_LABEL = {
   smoke:        "Smoke",
-  small_fire:   "Fire",
   large_fire:   "Fire (Large)",
   fire:         "Fire",
   weapon:       "Weapon",

@@ -7,11 +7,11 @@ import * as ort from "onnxruntime-node";
 import sharp from "sharp";
 import path from "path";
 import { fileURLToPath } from "url";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 import { ensureModel } from "./modelDownloader.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const log = pino({ name: "pose-detector" });
+const log = makeLogger("pose-detector");
 
 const MODEL_FILE  = "yolov8n-pose.onnx";
 const CONF_THRESH = 0.35;

@@ -1,12 +1,12 @@
 """
 V-JEPA + CLIP sidecar — runs as a child process of the Node.js backend.
-Loads VideoMAE-B (fire/smoke temporal), VideoMAE-L (V-JEPA ViT-H proxy, anomaly),
+Loads VideoMAE-L (V-JEPA ViT-H proxy, fire/smoke + anomaly),
 and CLIP ViT-L/14 (zero-shot semantic labels).
 Communicates via stdin/stdout JSON lines.
 
 Protocol (stdin → stdout):
   {"cmd": "ping"}
-  {"cmd": "infer",         "frames_b64": [...], "model": "B"|"H"}
+  {"cmd": "infer",         "frames_b64": [...], "model": "H"}
   {"cmd": "clip_classify", "image_b64": "...",  "prompts": [...]}   # optional prompts
   {"cmd": "anomaly_score", "frames_b64": [...], "camera_id": "...", "is_threat": false}
   {"cmd": "benchmark"}
@@ -30,8 +30,7 @@ _device = get_device()
 
 # ── VideoMAE model registry ───────────────────────────────────────────────────
 MODEL_IDS = {
-    "B": "MCG-NJU/videomae-base",   # ViT-B  — fire/smoke tier-2
-    "H": "MCG-NJU/videomae-large",  # ViT-L  — used as V-JEPA ViT-H proxy for anomaly
+    "H": "MCG-NJU/videomae-large",  # ViT-L  — used as V-JEPA ViT-H proxy for fire/smoke + anomaly
 }
 
 THREAT_CLASSES = ["no_fire", "smoke", "fire", "large_fire"]
@@ -70,7 +69,7 @@ DEFAULT_LABELS = [
     "Someone appears to be dancing",
     "Someone entering the room",
     "Suspicious behavior detected",
-    "Camera redirected to a different area",
+    None,   # camera redirected — not a threat, no alert
     None,   # normal → no alert
 ]
 
@@ -181,7 +180,7 @@ def infer_clip_tier2(frames_b64: list, size: str) -> dict:
 def compute_anomaly(camera_id: str, frames_b64: list, is_threat: bool = False) -> dict:
     """
     Compute cosine distance of current clip from camera's rolling baseline.
-    Uses VideoMAE-B (ViT-B) — fast, CPU-friendly, ~86M params.
+    Uses VideoMAE-L (ViT-L) — ~307M params.
     Baseline is updated only during non-threat cycles, giving a per-camera
     'normal scene' reference. Distance > ANOMALY_TRIGGER = unusual activity.
     """
@@ -300,6 +299,41 @@ def clip_classify_sequence(frames_b64: list, prompts: list) -> dict:
         "frame_count":  len(indices),
     }
 
+# ── V-JEPA temporal variance (intra-sequence change detection) ────────────────
+def compute_temporal_variance(frames_b64: list) -> dict:
+    """
+    Measures how much the video content changes WITHIN a frame sequence.
+    Splits frames into first-half and second-half, computes a VideoMAE embedding
+    for each half, and returns cosine similarity between them.
+
+    High similarity (> 0.97) → frames are essentially identical = static image / looping clip.
+    Low  similarity (< 0.90) → frames changed significantly = real dynamic scene.
+
+    This lets V-JEPA catch static fire photos even when YOLO bbox jitter makes
+    the bounding boxes look like they're "moving" (detection noise, not actual fire).
+    """
+    if len(frames_b64) < 2:
+        return {"temporal_similarity": 1.0, "is_static": True, "inference_ms": 0.0}
+
+    mid         = max(1, len(frames_b64) // 2)
+    first_half  = frames_b64[:mid]
+    second_half = frames_b64[mid:]
+
+    t0   = time.time()
+    emb1 = _get_embedding(first_half,  "H")
+    emb2 = _get_embedding(second_half, "H")
+    elapsed_ms = (time.time() - t0) * 1000
+
+    cos_sim   = F.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0)).item()
+    is_static = cos_sim > 0.97   # effectively identical across both halves
+
+    log(f"[temporal_variance] cos_sim={cos_sim:.4f} is_static={is_static} {elapsed_ms:.0f}ms")
+    return {
+        "temporal_similarity": round(cos_sim, 4),
+        "is_static":           is_static,
+        "inference_ms":        round(elapsed_ms, 1),
+    }
+
 # ── Benchmark ─────────────────────────────────────────────────────────────────
 def benchmark() -> dict:
     dummy_img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
@@ -309,17 +343,16 @@ def benchmark() -> dict:
     frames = [b64] * NUM_FRAMES
 
     results = {}
-    for size in ["B", "H"]:
-        m0 = _mem_mb(); load_videomae(size); m1 = _mem_mb()
-        infer_clip_tier2(frames, size)  # warm-up
-        times = [infer_clip_tier2(frames, size)["inference_ms"] for _ in range(3)]
-        results[size] = {
-            "model_id":          MODEL_IDS[size],
-            "ram_delta_mb":      round(m1 - m0, 1),
-            "inference_ms_avg":  round(sum(times) / len(times), 1),
-            "inference_ms_min":  round(min(times), 1),
-            "inference_ms_max":  round(max(times), 1),
-        }
+    m0 = _mem_mb(); load_videomae("H"); m1 = _mem_mb()
+    infer_clip_tier2(frames, "H")  # warm-up
+    times = [infer_clip_tier2(frames, "H")["inference_ms"] for _ in range(3)]
+    results["H"] = {
+        "model_id":          MODEL_IDS["H"],
+        "ram_delta_mb":      round(m1 - m0, 1),
+        "inference_ms_avg":  round(sum(times) / len(times), 1),
+        "inference_ms_min":  round(min(times), 1),
+        "inference_ms_max":  round(max(times), 1),
+    }
 
     # CLIP benchmark
     load_clip()
@@ -335,11 +368,10 @@ def benchmark() -> dict:
 def main():
     log(f"Starting on device: {_device} | Python {sys.version.split()[0]}")
 
-    for size in ["B", "H"]:
-        try:
-            load_videomae(size)
-        except Exception as e:
-            log(f"Failed to pre-load VideoMAE-{size}: {e}")
+    try:
+        load_videomae("H")
+    except Exception as e:
+        log(f"Failed to pre-load VideoMAE-H: {e}")
 
     try:
         load_clip()
@@ -360,7 +392,7 @@ def main():
                 respond({"ok": True, "pong": True})
 
             elif cmd == "infer":
-                size       = msg.get("model", "B").upper()
+                size       = msg.get("model", "H").upper()
                 frames_b64 = msg.get("frames_b64", [])
                 if not frames_b64:
                     respond({"ok": False, "error": "No frames provided"}); continue
@@ -398,6 +430,13 @@ def main():
                 if not frames_b64:
                     respond({"ok": False, "error": "No frames provided"}); continue
                 result = compute_anomaly(camera_id, frames_b64, is_threat)
+                respond({"ok": True, **result})
+
+            elif cmd == "frame_temporal_variance":
+                frames_b64 = msg.get("frames_b64", [])
+                if not frames_b64:
+                    respond({"ok": False, "error": "No frames provided"}); continue
+                result = compute_temporal_variance(frames_b64)
                 respond({"ok": True, **result})
 
             elif cmd == "benchmark":

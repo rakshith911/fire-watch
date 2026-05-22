@@ -1,8 +1,8 @@
 import fetch from "node-fetch";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 import { grabMultipleFrames } from "./localDetector.js";
 
-const log = pino({ name: "cloud-detector" });
+const log = makeLogger("cloud-detector");
 
 // ===================================================================
 // ☁️ POST Frame to AWS Fire Detection Endpoint

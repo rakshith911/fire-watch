@@ -3,9 +3,9 @@ import {
   PublishCommand,
   ListSubscriptionsByTopicCommand,
 } from "@aws-sdk/client-sns";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 
-const log = pino({ name: "sns-service" });
+const log = makeLogger("sns-service");
 
 const snsClient = new SNSClient({
   region: process.env.AWS_REGION || "us-east-1",
@@ -37,6 +37,10 @@ export async function sendFireAlert(
   imageUrl = null
 ) {
   try {
+    if (!SNS_TOPIC_ARN) {
+      throw new Error("SNS_TOPIC_ARN is not configured");
+    }
+
     // ✅ User is pre-subscribed via standalone script
     // ✅ SNS filtering ensures only the target userId receives the notification
 
@@ -76,11 +80,11 @@ export async function sendFireAlert(
       MessageAttributes: {
         userId: {
           DataType: "String",
-          StringValue: userId,
+          StringValue: String(userId),
         },
         cameraId: {
           DataType: "String",
-          StringValue: cameraId,
+          StringValue: String(cameraId),
         },
       },
     });

@@ -2,12 +2,12 @@ import * as ort from "onnxruntime-node";
 import sharp from "sharp";
 import { spawn } from "node:child_process";
 import { cfg } from "../config.js";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const log = pino({ name: "local-detector" });
+const log = makeLogger("local-detector");
 const FRAME_READ_RETRIES = 3;
 const FRAME_READ_RETRY_DELAY_MS = 500;
 
@@ -318,7 +318,7 @@ function processOutput(outputs, originalWidth, originalHeight, scale, padX, padY
   const numQueries = 300; // Standard RT-DETR query count
   const numClasses = 3; // Fire, Other, Smoke (per model training spec)
   const fireProbThreshold = 0.5; // Confidence threshold (0.5 recommended for production)
-  const smokeProbThreshold = 0.7; // Smoke needs higher confidence to reduce haze/steam false positives
+  const smokeProbThreshold = 0.35; // Smoke scores lower in this model; logs show typical smoke confidence around 0.27-0.43
 
   // Helper to get box coordinates
   const getBox = (i) => {
@@ -554,6 +554,76 @@ export async function detectFireMultiFrame(cameraUrl, cameraName, numFrames = 3,
     return results;
   } catch (error) {
     log.error({ camera: cameraName, error: error.message }, "🔥 LOCAL: Multi-frame detection failed");
+    return [{
+      isFire: false,
+      confidence: 0,
+      boxes: [],
+      error: error.message,
+      transientReadError: true,
+      frameBuffer: null,
+    }];
+  }
+}
+
+/**
+ * Detect fire across multiple frames with multiple fire models using the same
+ * grabbed frames. A frame is fire-positive when any model reports fire/smoke.
+ */
+export async function detectFireMultiModelFrame(cameraUrl, cameraName, numFrames = 3, modelFiles = ["best.onnx"]) {
+  try {
+    const jpegBuffers = await grabMultipleFrames(cameraUrl, numFrames);
+    const results = [];
+
+    for (let i = 0; i < jpegBuffers.length; i++) {
+      const jpegBuffer = jpegBuffers[i];
+      const { tensor, originalWidth, originalHeight, scale, padX, padY } = await prepareInput(jpegBuffer, 640);
+      const modelResults = [];
+
+      for (const modelFile of modelFiles) {
+        const outputs = await runInference(tensor, modelFile);
+        const result = processOutput(outputs, originalWidth, originalHeight, scale, padX, padY);
+        modelResults.push({ modelFile, result });
+
+        log.info({
+          camera: cameraName,
+          modelFile,
+          frame: `${i + 1}/${jpegBuffers.length}`,
+          jpegSize: `${(jpegBuffer.length / 1024).toFixed(1)}KB`,
+          resolution: `${originalWidth}x${originalHeight}`,
+          detected: result.detected,
+          fireCount: result.fireCount,
+          smokeCount: result.smokeCount,
+          topScore: result.boxes.length > 0 ? result.boxes[0][5].toFixed(4) : "none",
+        }, `🔥 LOCAL: Multi-model frame ${i + 1} inference result`);
+      }
+
+      const boxes = modelResults
+        .flatMap(({ modelFile, result }) =>
+          result.boxes.map((box) => [...box.slice(0, 6), modelFile])
+        )
+        .sort((a, b) => (b[5] || 0) - (a[5] || 0));
+
+      results.push({
+        isFire: boxes.length > 0,
+        confidence: boxes.length > 0 ? boxes[0][5] : 0,
+        boxes,
+        fireCount: modelResults.reduce((sum, r) => sum + r.result.fireCount, 0),
+        smokeCount: modelResults.reduce((sum, r) => sum + r.result.smokeCount, 0),
+        frameBuffer: jpegBuffer,
+        modelFiles,
+      });
+    }
+
+    log.info({
+      camera: cameraName,
+      modelFiles,
+      framesExtracted: jpegBuffers.length,
+      framesWithFire: results.filter(r => r.isFire).length,
+    }, "🔥 LOCAL: Multi-model detection complete");
+
+    return results;
+  } catch (error) {
+    log.error({ camera: cameraName, modelFiles, error: error.message }, "🔥 LOCAL: Multi-model detection failed");
     return [{
       isFire: false,
       confidence: 0,

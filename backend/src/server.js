@@ -2,7 +2,6 @@ import express from "express";
 import { WebSocketServer } from "ws";
 import { createServer } from "http";
 import cors from "cors";
-import pino from "pino";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -23,8 +22,9 @@ import {
   handleFrontendDetection,
 } from "./services/detectionQueue.js";
 import { dynamodb } from "./db/dynamodb.js";
+import { makeLogger, eventsFile } from "./logger.js";
 
-const log = pino({ name: "server" });
+const log = makeLogger("server");
 const app = express();
 const httpServer = createServer(app);
 
@@ -224,6 +224,23 @@ export function broadcastFireDetection(userId, id, cameraName, isFire, metadata 
     ...metadata  // Spread any additional metadata (iouAnalysis, motionAnalysis, etc.)
   });
 
+  // Append threat events to a persistent JSONL log for later review
+  if (isFire) {
+    const event = JSON.stringify({
+      ts:          new Date().toISOString(),
+      cameraId:    id,
+      cameraName,
+      alertType:   metadata.alertType   ?? null,
+      confidence:  metadata.confidence  ?? null,
+      isBehavioral: metadata.isBehavioral ?? false,
+      boxes:       (metadata.boxes ?? []).length,
+    });
+    const logPath = eventsFile;
+    fs.appendFile(logPath, event + "\n", (err) => {
+      if (err) log.warn({ err: err.message }, "Failed to write detection event log");
+    });
+  }
+
   log.info(
     { userId, id, clientCount: clients.size, payloadSize: payload.length },
     "📡 Sending to WebSocket clients"
@@ -298,9 +315,9 @@ app.get("/diagnostics", async (_req, res) => {
 
   const requiredModels = [
     "best.onnx",
-    "best_s.onnx",
     "weapons.onnx",
     "weapons_yolo.onnx",
+    "mask_yolov5.onnx",
     "yolov11n_bestFire.onnx",
     "yolov8n.onnx",
     "yolov8n-pose.onnx",
@@ -363,9 +380,9 @@ app.get("*", (req, res) => {
 // Models that MUST exist before detection starts (no public fallback)
 const STATIC_MODELS = [
   { name: "best.onnx",              purpose: "Fire/Smoke Detection (RT-DETR, primary)" },
-  { name: "best_s.onnx",            purpose: "Small Fire Detection (candles/embers)" },
   { name: "weapons.onnx",           purpose: "Weapon Detection (RT-DETR, high accuracy)" },
   { name: "weapons_yolo.onnx",      purpose: "Weapon Detection (YOLOv8n, fast)" },
+  { name: "mask_yolov5.onnx",       purpose: "Face Mask Detection (YOLOv5, behavioral pipeline)" },
   { name: "yolov11n_bestFire.onnx", purpose: "Fire Detection (YOLOv11n, fast)" },
   { name: "yolov8n.onnx",           purpose: "Person Detection (behavioral pipeline)" },
   { name: "yolov8n-pose.onnx",      purpose: "Pose Estimation (behavioral pipeline)" },
@@ -406,9 +423,11 @@ function checkModelsAtStartup() {
     };
     modelStatus.push(status);
 
+    const canAutoDownload = ["yolov8n.onnx", "yolov8n-pose.onnx"].includes(model.name);
+
     if (exists) {
       log.info({ ...status }, `✅ ${model.name}`);
-    } else if (isAutoDownload) {
+    } else if (canAutoDownload) {
       log.info({ ...status }, `⬇️  ${model.name} — will auto-download on first use`);
     } else {
       log.error({ ...status }, `❌ ${model.name} - MISSING!`);

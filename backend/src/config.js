@@ -3,9 +3,11 @@ import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import os from "os";
+import { makeLogger } from "./logger.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const log = makeLogger("config");
 
 // ✅ Detect Electron mode
 const isElectron = process.env.ELECTRON === "true";
@@ -14,7 +16,7 @@ const isElectron = process.env.ELECTRON === "true";
 function getFfmpegPath() {
   // 1. Explicit override from environment
   if (process.env.FFMPEG_BIN) {
-    console.log("🎬 Using FFMPEG_BIN from env:", process.env.FFMPEG_BIN);
+    log.info({ ffmpeg: process.env.FFMPEG_BIN }, "Using FFMPEG_BIN from env");
     return process.env.FFMPEG_BIN;
   }
 
@@ -23,7 +25,7 @@ function getFfmpegPath() {
     // In production, backend is in resources/backend
     const bundledPath = path.resolve(__dirname, "../bin/ffmpeg");
     if (fs.existsSync(bundledPath)) {
-      console.log("🎬 Using bundled ffmpeg:", bundledPath);
+      log.info({ ffmpeg: bundledPath }, "Using bundled ffmpeg");
       return bundledPath;
     }
   }
@@ -31,12 +33,12 @@ function getFfmpegPath() {
   // 3. Local development - check backend/bin
   const devPath = path.resolve(__dirname, "../bin/ffmpeg");
   if (fs.existsSync(devPath)) {
-    console.log("🎬 Using local ffmpeg:", devPath);
+    log.info({ ffmpeg: devPath }, "Using local ffmpeg");
     return devPath;
   }
 
   // 4. System ffmpeg (fallback)
-  console.log("🎬 Using system ffmpeg");
+  log.info("Using system ffmpeg");
   return "ffmpeg";
 }
 
@@ -69,18 +71,18 @@ export const cfg = {
   backendDetectionEnabled: process.env.BACKEND_DETECTION_ENABLED === "true",
 };
 
-console.log("✅ Config loaded - DynamoDB mode (no local database)");
-console.log("🔥 Fire Endpoint:", cfg.fireEndpoint);
-console.log("🎥 Backend detection auto-start:", cfg.backendDetectionEnabled ? "enabled" : "disabled");
+log.info({
+  fireEndpoint: cfg.fireEndpoint,
+  backendDetectionEnabled: cfg.backendDetectionEnabled,
+}, "Config loaded - DynamoDB mode");
 
 // Validate ffmpeg exists
 if (cfg.ffmpeg !== "ffmpeg") {
   if (fs.existsSync(cfg.ffmpeg)) {
-    console.log("✅ ffmpeg found at:", cfg.ffmpeg);
+    log.info({ ffmpeg: cfg.ffmpeg }, "ffmpeg found");
   } else {
-    console.error("❌ CRITICAL: ffmpeg NOT FOUND at:", cfg.ffmpeg);
-    console.error("   Detection will NOT work without ffmpeg!");
+    log.error({ ffmpeg: cfg.ffmpeg }, "CRITICAL: ffmpeg not found; detection will not work");
   }
 } else {
-  console.log("🎬 Using system ffmpeg (must be in PATH)");
+  log.info("Using system ffmpeg; must be in PATH");
 }

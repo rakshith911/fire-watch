@@ -30,8 +30,7 @@ const ViewingStatusIcon = ({ isVisible }) => {
 };
 
 export default function Status({ onNavigate, currentPage = "status" }) {
-  const { cameras, deleteCamera, updateCamera, fetchCamerasFromDB } =
-    useCameras();
+  const { cameras, deleteCamera, updateCamera } = useCameras();
   const { logout } = useAuth();
   const [showAdd, setShowAdd] = useState(false);
   const [theme, setTheme] = useState(
@@ -46,6 +45,7 @@ export default function Status({ onNavigate, currentPage = "status" }) {
   const [filter, setFilter] = useState("all");
   const [samplingRate, setSamplingRate] = useState(30000); // Default 30 seconds
   const [updatingSamplingRate, setUpdatingSamplingRate] = useState(false);
+  const [updatingAiType, setUpdatingAiType] = useState(new Set());
 
   const handleNavigate = (page) => {
     if (onNavigate) {
@@ -63,8 +63,6 @@ export default function Status({ onNavigate, currentPage = "status" }) {
         setEditingCameraId(null);
         setEditedValues({});
         setShowPassword(false);
-
-        await fetchCamerasFromDB();
       } catch (error) {
         console.error("Failed to save camera: ", error);
         alert(`Failed to save camera: ${error.message}`);
@@ -124,6 +122,22 @@ export default function Status({ onNavigate, currentPage = "status" }) {
   };
 
 
+
+  const handleAiTypeChange = async (cameraId, newAiType) => {
+    setUpdatingAiType((prev) => new Set([...prev, cameraId]));
+    try {
+      await updateCamera(cameraId, { aiType: newAiType });
+    } catch (error) {
+      console.error("Failed to update AI type: ", error);
+      alert(`Failed to update AI type: ${error.message}`);
+    } finally {
+      setUpdatingAiType((prev) => {
+        const next = new Set(prev);
+        next.delete(cameraId);
+        return next;
+      });
+    }
+  };
 
   // Filter and search cameras
   const visibleCameras = useMemo(() => {
@@ -388,6 +402,7 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                     <div className="header-cell streampath-col">Stream Path</div>
                     <div className="header-cell view-col">View</div>
                     <div className="header-cell stream-col">Stream</div>
+                    <div className="header-cell aitype-col">AI Mode</div>
                     <div className="header-cell actions-col">Actions</div>
                   </div>
                   <div className="modern-table-body">
@@ -539,6 +554,21 @@ export default function Status({ onNavigate, currentPage = "status" }) {
                               isStreaming={c.isStreaming}
                               size={28}
                             />
+                          </div>
+                          <div className="table-cell aitype-col">
+                            <span className="cell-label">AI Mode</span>
+                            <div className="aitype-select-wrapper">
+                              <select
+                                className={`aitype-select ${updatingAiType.has(c.id) ? "updating" : ""}`}
+                                value={c.aiType || "FIRE"}
+                                onChange={(e) => handleAiTypeChange(c.id, e.target.value)}
+                                disabled={updatingAiType.has(c.id)}
+                              >
+                                <option value="FIRE">Fire &amp; Smoke</option>
+                                <option value="WEAPON">Weapon</option>
+                                <option value="MASK">Face Mask</option>
+                              </select>
+                            </div>
                           </div>
                           <div className="table-cell actions-col">
                             <span className="cell-label">Actions</span>

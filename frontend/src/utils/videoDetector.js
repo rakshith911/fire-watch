@@ -260,11 +260,19 @@ export class VideoDetector {
       );
 
       this._worker.onmessage = (evt) => {
-        const output = evt.data;
+        // Worker now sends { data, dims } — fall back to raw array for compatibility
+        const msg = evt.data;
+        const output = (msg && msg.data) ? msg.data : msg;
+        const dims   = (msg && msg.dims) ? msg.dims : null;
+        if (dims && !this._dimsLogged) {
+          console.log(`[${this.id}] fire model output dims: [${dims}]`);
+          this._dimsLogged = true;
+        }
         this._boxes = this._processOutput(
           output,
           this._overlay.width,
-          this._overlay.height
+          this._overlay.height,
+          dims
         );
         this.onDetections(this._boxes);
         this._busy = false;
@@ -340,7 +348,6 @@ export class VideoDetector {
   _prepareInput() {
     const S = this.modelInputSize;
 
-    // cache a scratch canvas so we don't recreate it every frame
     if (!this._scratch) {
       this._scratch = document.createElement("canvas");
       this._scratch.width = S;
@@ -350,18 +357,30 @@ export class VideoDetector {
       });
     }
 
-    // draw the current video frame into the scratch canvas at model size
-    // this._scratchCtx.drawImage(this._video, 0, 0, S, S);
+    const vw = this._video.videoWidth;
+    const vh = this._video.videoHeight;
+    if (!vw || !vh) return null;
 
-    // const data = this._scratchCtx.getImageData(0, 0, S, S).data;
+    // Letterbox: preserve aspect ratio with gray padding — matches YOLO training preprocessing.
+    // Stretching to 640x640 distorts thin objects (knives, faces) and kills detection confidence.
+    const scale = Math.min(S / vw, S / vh);
+    const newW  = Math.round(vw * scale);
+    const newH  = Math.round(vh * scale);
+    const padX  = Math.floor((S - newW) / 2);
+    const padY  = Math.floor((S - newH) / 2);
+    this._lbScale = scale;
+    this._lbPadX  = padX;
+    this._lbPadY  = padY;
 
-    this._scratchCtx.drawImage(this._video, 0, 0, S, S);
+    this._scratchCtx.fillStyle = "rgb(114,114,114)";
+    this._scratchCtx.fillRect(0, 0, S, S);
+    this._scratchCtx.drawImage(this._video, padX, padY, newW, newH);
+
     let data;
     try {
       data = this._scratchCtx.getImageData(0, 0, S, S).data;
     } catch (e) {
       if (e.name === "SecurityError") {
-        // frame came from a CORS-blocked source, skip gracefully
         if (!this._corsWarned) {
           console.warn(`[${this.id}] CORS SecurityError in getImageData — canvas tainted. Detection disabled for this stream.`);
           this._corsWarned = true;
@@ -373,7 +392,7 @@ export class VideoDetector {
       throw e;
     }
     const N = S * S;
-    const arr = new Float32Array(N * 3); // CHW, [0..1]
+    const arr = new Float32Array(N * 3);
 
     let r = 0,
       g = N,
@@ -383,56 +402,118 @@ export class VideoDetector {
       arr[g++] = data[i + 1] / 255;
       arr[b++] = data[i + 2] / 255;
     }
-    return arr.buffer; // transferable ArrayBuffer
+    return arr.buffer;
   }
 
-  _processOutput(output, imgW, imgH) {
-    // Mirrors your logic but scoped to this instance, with minor safeguards.
+  _processOutput(output, imgW, imgH, dims) {
+    if (output && typeof output === "object" && "data" in output) {
+      dims = output.dims || dims;
+      output = output.data;
+    }
+    if (!output || output.length === 0) return [];
     let boxes = [];
     let fireCount = 0;
     let smokeCount = 0;
     let totalFireArea = 0;
 
-    const cells = 8400; // model-specific
-    const clsCount = 3; // Fire/Smoke/Other
-    const fireProbThreshold = 0.2;
-    const smokeProbThreshold = 0.7;
+    const sc  = this._lbScale || 1;
+    const lpx = this._lbPadX  || 0;
+    const lpy = this._lbPadY  || 0;
 
-    for (let i = 0; i < cells; i++) {
-      // pick max-prob class
-      let classId = 0,
-        best = 0;
-      for (let c = 0; c < clsCount; c++) {
-        const p = output[cells * (c + 4) + i];
-        if (p > best) {
-          best = p;
-          classId = c;
+    // Determine format from actual dims when available, else fall back to heuristic.
+    // ScaledYOLOv4 exports [1, N_anchors, 7] (anchor-first, has objectness).
+    // YOLOv8/v11 exports  [1, C, 8400]       (channel-first, no objectness).
+    let isAnchorFirst, anchors, channels;
+    if (dims && dims.length >= 3) {
+      // Use exact shape from tensor dims — no guessing
+      const d1 = dims[dims.length - 2];
+      const d2 = dims[dims.length - 1];
+      isAnchorFirst = d1 > d2;   // [N, 7] → anchor-first;  [C, 8400] → channel-first
+      anchors  = isAnchorFirst ? d1 : d2;
+      channels = isAnchorFirst ? d2 : d1;
+    } else {
+      const CELLS_V8 = 8400;
+      const ch = output.length / CELLS_V8;
+      isAnchorFirst = !(Number.isInteger(ch) && ch <= 16);
+      anchors  = isAnchorFirst ? Math.round(output.length / 7) : CELLS_V8;
+      channels = isAnchorFirst ? 7 : ch;
+    }
+
+    if (!isAnchorFirst) {
+      // YOLOv8/v11: no objectness, channel-first [C, anchors]
+      const clsCount = Math.round(channels) - 4;
+      const labels = clsCount >= 3 ? ["Fire", "Smoke", "Other"] : ["Fire", "Smoke"];
+      const fireProbThreshold  = 0.7;
+      const smokeProbThreshold = 0.35;
+
+      for (let i = 0; i < anchors; i++) {
+        let classId = 0, best = 0;
+        for (let c = 0; c < clsCount; c++) {
+          const p = output[anchors * (c + 4) + i];
+          if (p > best) { best = p; classId = c; }
         }
+        const label = labels[classId] || "Other";
+        if (label === "Other") continue;
+        const minScore = label === "Smoke" ? smokeProbThreshold : fireProbThreshold;
+        if (best < minScore) continue;
+
+        const xc = output[i];
+        const yc = output[anchors + i];
+        const w  = output[2 * anchors + i];
+        const h  = output[3 * anchors + i];
+
+        const x1 = Math.max(0, Math.min(imgW, (xc - w / 2 - lpx) / sc));
+        const y1 = Math.max(0, Math.min(imgH, (yc - h / 2 - lpy) / sc));
+        const x2 = Math.max(0, Math.min(imgW, (xc + w / 2 - lpx) / sc));
+        const y2 = Math.max(0, Math.min(imgH, (yc + h / 2 - lpy) / sc));
+
+        const area = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+        if (area < Math.max(1, imgW * imgH) * 0.001) continue;
+
+        boxes.push([x1, y1, x2, y2, label, best]);
+        if (label === "Fire")  { fireCount++;  totalFireArea += area; }
+        if (label === "Smoke") { smokeCount++; totalFireArea += area; }
       }
-      const label = ["Fire", "Smoke", "Other"][classId];
-      const minScore = label === "Smoke" ? smokeProbThreshold : fireProbThreshold;
-      if (best < minScore) continue;
+    } else {
+      // ScaledYOLOv4-P5 anchor-first [anchors, channels] with objectness
+      // Per anchor: cx, cy, w, h, objectness, fire_score, smoke_score
+      const labels = ["Fire", "Smoke"];
+      const fireThreshold  = 0.45;
+      const smokeThreshold = 0.35;
 
-      const xc = output[i];
-      const yc = output[cells + i];
-      const w = output[2 * cells + i];
-      const h = output[3 * cells + i];
+      for (let i = 0; i < anchors; i++) {
+        const base = i * channels;
+        const obj  = output[base + 4];
+        if (obj < 0.35) continue;
 
-      const x1 = ((xc - w / 2) / 640) * imgW;
-      const y1 = ((yc - h / 2) / 640) * imgH;
-      const x2 = ((xc + w / 2) / 640) * imgW;
-      const y2 = ((yc + h / 2) / 640) * imgH;
+        let classId = 0, bestClass = 0;
+        for (let c = 0; c < labels.length; c++) {
+          const p = output[base + 5 + c];
+          if (p > bestClass) { bestClass = p; classId = c; }
+        }
+        const score = obj * bestClass;
+        const label = labels[classId];
+        const minScore = label === "Smoke" ? smokeThreshold : fireThreshold;
+        if (score < minScore) continue;
 
-      boxes.push([x1, y1, x2, y2, label, best]);
+        const xc = output[base + 0];
+        const yc = output[base + 1];
+        const w  = output[base + 2];
+        const h  = output[base + 3];
 
-      const area = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-      if (label === "Fire") {
-        fireCount++;
-        totalFireArea += area;
-      }
-      if (label === "Smoke") {
-        smokeCount++;
-        totalFireArea += area;
+        const x1 = Math.max(0, Math.min(imgW, (xc - w / 2 - lpx) / sc));
+        const y1 = Math.max(0, Math.min(imgH, (yc - h / 2 - lpy) / sc));
+        const x2 = Math.max(0, Math.min(imgW, (xc + w / 2 - lpx) / sc));
+        const y2 = Math.max(0, Math.min(imgH, (yc + h / 2 - lpy) / sc));
+
+        const area = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+        if (area < Math.max(1, imgW * imgH) * 0.001) continue;
+        // Reject boxes that cover more than 90% of the frame — usually false positives
+        if (area > imgW * imgH * 0.90) continue;
+
+        boxes.push([x1, y1, x2, y2, label, score]);
+        if (label === "Fire")  { fireCount++;  totalFireArea += area; }
+        if (label === "Smoke") { smokeCount++; totalFireArea += area; }
       }
     }
 
@@ -500,22 +581,35 @@ export class VideoDetector {
   }
 
   _processOutputWeapon(output, imgW, imgH) {
-    // YOLO column-major format: [1, (4+C), 8400] in 640px space
-    // Same structure as fire model but with weapon classes
+    if (output && typeof output === "object" && "newOut" in output) {
+      output = output.newOut;
+    }
+    if (!output || output.length === 0) return [];
+    // YOLO column-major format: [1, (4+C), 8400] in 640px space.
+    // We detect the number of classes from output length so this works whether
+    // the model has 1 class or the 4-class threat label set. In the threat
+    // model, only class 3 is knife.
     let boxes = [];
     const cells = 8400;
-    const clsCount = 2; // Model outputs Knife/Pistol; app only accepts Knife.
-    const probThreshold = 0.55;
-    const labels = ["Knife", "Pistol"];
+    const numClasses = Math.max(1, Math.round(output.length / cells) - 4);
+    const threatLabels = ["Gun", "explosion", "grenade", "knife"];
+    const probThreshold = 0.40;
+    const sc  = this._lbScale || 1;
+    const lpx = this._lbPadX  || 0;
+    const lpy = this._lbPadY  || 0;
 
     for (let i = 0; i < cells; i++) {
-      // pick max-prob class
-      let classId = 0, best = 0;
-      for (let c = 0; c < clsCount; c++) {
+      let best = 0;
+      let classId = 0;
+      for (let c = 0; c < numClasses; c++) {
         const p = output[cells * (c + 4) + i];
-        if (p > best) { best = p; classId = c; }
+        if (p > best) {
+          best = p;
+          classId = c;
+        }
       }
-      if (labels[classId] !== "Knife") continue;
+      const label = numClasses === 1 ? "knife" : threatLabels[classId];
+      if (label !== "knife") continue;
       if (best < probThreshold) continue;
 
       const xc = output[i];
@@ -523,12 +617,12 @@ export class VideoDetector {
       const w  = output[2 * cells + i];
       const h  = output[3 * cells + i];
 
-      const x1 = ((xc - w / 2) / 640) * imgW;
-      const y1 = ((yc - h / 2) / 640) * imgH;
-      const x2 = ((xc + w / 2) / 640) * imgW;
-      const y2 = ((yc + h / 2) / 640) * imgH;
+      const x1 = Math.max(0, Math.min(imgW, (xc - w / 2 - lpx) / sc));
+      const y1 = Math.max(0, Math.min(imgH, (yc - h / 2 - lpy) / sc));
+      const x2 = Math.max(0, Math.min(imgW, (xc + w / 2 - lpx) / sc));
+      const y2 = Math.max(0, Math.min(imgH, (yc + h / 2 - lpy) / sc));
 
-      boxes.push([x1, y1, x2, y2, labels[classId], best]);
+      boxes.push([x1, y1, x2, y2, "knife", best]);
     }
 
     // NMS
@@ -550,6 +644,114 @@ export class VideoDetector {
     return keep;
   }
 
+  // Legacy weapons_yolo.onnx — all detections labeled "Knife" (uppercase for colorMap)
+  _processOutputWeaponLegacy(output, imgW, imgH) {
+    if (!output || output.length === 0) return [];
+    let boxes = [];
+    const cells = 8400;
+    const numClasses = Math.max(1, Math.round(output.length / cells) - 4);
+    const probThreshold = 0.40;
+    const sc  = this._lbScale || 1;
+    const lpx = this._lbPadX  || 0;
+    const lpy = this._lbPadY  || 0;
+
+    for (let i = 0; i < cells; i++) {
+      let best = 0;
+      for (let c = 0; c < numClasses; c++) {
+        const p = output[cells * (c + 4) + i];
+        if (p > best) best = p;
+      }
+      if (best < probThreshold) continue;
+
+      const xc = output[i];
+      const yc = output[cells + i];
+      const w  = output[2 * cells + i];
+      const h  = output[3 * cells + i];
+      boxes.push([
+        Math.max(0, Math.min(imgW, (xc - w / 2 - lpx) / sc)),
+        Math.max(0, Math.min(imgH, (yc - h / 2 - lpy) / sc)),
+        Math.max(0, Math.min(imgW, (xc + w / 2 - lpx) / sc)),
+        Math.max(0, Math.min(imgH, (yc + h / 2 - lpy) / sc)),
+        "Knife", best,
+      ]);
+    }
+
+    boxes.sort((a, b) => b[5] - a[5]);
+    const keep = [];
+    const iou = (A, B) => {
+      const ix1 = Math.max(A[0], B[0]), iy1 = Math.max(A[1], B[1]);
+      const ix2 = Math.min(A[2], B[2]), iy2 = Math.min(A[3], B[3]);
+      const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+      return inter / ((A[2]-A[0])*(A[3]-A[1]) + (B[2]-B[0])*(B[3]-B[1]) - inter || 1);
+    };
+    while (boxes.length) {
+      const head = boxes.shift();
+      keep.push(head);
+      boxes = boxes.filter((b) => iou(head, b) < 0.7);
+    }
+    return keep;
+  }
+
+  _processOutputMask(output, imgW, imgH) {
+    if (!output || output.length === 0) return [];
+    // YOLOv5 row-major format: [1, 25200, 8] = x,y,w,h,obj,3 class scores.
+    let boxes = [];
+    const channels = 8;
+    const cells = Math.floor(output.length / channels);
+    const labels = ["with_mask", "without_mask", "mask_weared_incorrect"];
+    const probThreshold = 0.75;
+
+    for (let i = 0; i < cells; i++) {
+      const base = i * channels;
+      const objectness = output[base + 4];
+      if (objectness < 0.20) continue;
+
+      let classId = 0, bestClass = 0;
+      for (let c = 0; c < labels.length; c++) {
+        const p = output[base + 5 + c];
+        if (p > bestClass) { bestClass = p; classId = c; }
+      }
+
+      const label = labels[classId];
+      if (label === "without_mask") continue;
+
+      const score = objectness * bestClass;
+      if (score < probThreshold) continue;
+
+      const xc = output[base];
+      const yc = output[base + 1];
+      const w  = output[base + 2];
+      const h  = output[base + 3];
+
+      const sc  = this._lbScale || 1;
+      const lpx = this._lbPadX  || 0;
+      const lpy = this._lbPadY  || 0;
+      const x1  = Math.max(0, Math.min(imgW, (xc - w / 2 - lpx) / sc));
+      const y1  = Math.max(0, Math.min(imgH, (yc - h / 2 - lpy) / sc));
+      const x2  = Math.max(0, Math.min(imgW, (xc + w / 2 - lpx) / sc));
+      const y2  = Math.max(0, Math.min(imgH, (yc + h / 2 - lpy) / sc));
+
+      boxes.push([x1, y1, x2, y2, label, score]);
+    }
+
+    boxes.sort((a, b) => b[5] - a[5]);
+    const keep = [];
+    const iou = (A, B) => {
+      const ix1 = Math.max(A[0], B[0]), iy1 = Math.max(A[1], B[1]);
+      const ix2 = Math.min(A[2], B[2]), iy2 = Math.min(A[3], B[3]);
+      const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+      const areaA = (A[2] - A[0]) * (A[3] - A[1]);
+      const areaB = (B[2] - B[0]) * (B[3] - B[1]);
+      return inter / (areaA + areaB - inter || 1);
+    };
+    while (boxes.length) {
+      const head = boxes.shift();
+      keep.push(head);
+      boxes = boxes.filter((b) => iou(head, b) < 0.45);
+    }
+    return keep;
+  }
+
   _drawBoxes(boxes) {
     const ctx = this._ctx;
     ctx.save();
@@ -567,16 +769,23 @@ export class VideoDetector {
     const colorMap = {
       Fire: "#00FF00",
       Smoke: "#00FF00",
-      Other: "#00FF00",
       Knife: "#FF0000",
+      knife: "#FF0000",
+      with_mask: "#bd93f9",
+      mask_weared_incorrect: "#bd93f9",
     };
 
     boxes.forEach(([x1, y1, x2, y2, label]) => {
       const color = colorMap[label] || "#00FF00";
+      const displayLabel = label === "with_mask"
+        ? "Mask"
+        : label === "mask_weared_incorrect"
+          ? "Mask worn incorrectly"
+          : label;
       ctx.strokeStyle = color;
       ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
       ctx.fillStyle = color;
-      const w = ctx.measureText(label).width;
+      const w = ctx.measureText(displayLabel).width;
       ctx.fillRect(
         x1,
         Math.max(0, y1 - labelHeight),
@@ -585,7 +794,7 @@ export class VideoDetector {
       );
       ctx.fillStyle = "#000";
       ctx.fillText(
-        label,
+        displayLabel,
         x1 + labelPadding,
         Math.max(fontSize, y1 - labelPadding)
       );

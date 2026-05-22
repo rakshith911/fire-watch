@@ -13,14 +13,14 @@ import * as ort from "onnxruntime-node";
 import sharp from "sharp";
 import path from "path";
 import { fileURLToPath } from "url";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 import { ensureModel } from "./modelDownloader.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const log = pino({ name: "person-detector" });
+const log = makeLogger("person-detector");
 
 const MODEL_FILE  = "yolov8n.onnx";
-const CONF_THRESH      = 0.35;
+const CONF_THRESH      = 0.50;
 const IOU_THRESH       = 0.45;
 const PERSON_CLS       = 0;    // COCO class 0 = person
 const MIN_HEIGHT_RATIO = 0.15; // bbox must be ≥15% of frame height
@@ -129,6 +129,7 @@ function decode(outputs, origW, origH, scale, padX, padY) {
     const bboxW = x2 - x1;
     if (bboxH / origH < MIN_HEIGHT_RATIO) return [];           // too small — likely partial limb
     if (bboxW > 0 && bboxH / bboxW < MIN_ASPECT_RATIO) return []; // wider than tall — not a person
+    if (bboxW / origW > 0.85 && bboxH / origH > 0.85) return []; // near-full-frame — screen/wall FP
     return [[x1, y1, x2, y2, "Person", score]];
   });
 }

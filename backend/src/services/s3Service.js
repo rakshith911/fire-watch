@@ -1,8 +1,8 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import sharp from "sharp";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 
-const log = pino({ name: "s3-service" });
+const log = makeLogger("s3-service");
 
 const s3Client = new S3Client({
   region: process.env.AWS_REGION || "us-east-1",

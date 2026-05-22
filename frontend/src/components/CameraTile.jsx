@@ -522,6 +522,7 @@ import { getMediaMTXUrl } from "../config/electron.js";
 import { sendDetectionEvent } from "../utils/webSocketClient.js";
 import fireWorkerUrl from "../utils/worker-client.js?worker&url";
 import weaponWorkerUrl from "../utils/worker-weapon.js?worker&url";
+import maskWorkerUrl from "../utils/worker-mask.js?worker&url";
 
 // We'll lazy-load your ESM VideoDetector class from utils directory
 let VideoDetectorClassPromise;
@@ -541,8 +542,10 @@ export default function CameraTile({ cam }) {
   const [isStreaming, setIsStreaming] = useState(false);
   const [viewed, setViewed] = useState(true);
   const [showSpinner, setShowSpinner] = useState(false);
+  const [staticNotice, setStaticNotice] = useState(false);
   const [alertType, setAlertType] = useState(null); // "Fire", "Knife", etc.
-  const { updateCameraStatus, showBoundingBoxes } = useCameras();
+  const [liveMaskPresent, setLiveMaskPresent] = useState(false);
+  const { updateCameraStatus, showBoundingBoxes, updateCamera } = useCameras();
 
   // Run both fire + weapon YOLO in-browser for real-time bounding boxes.
   // Backend still does CLIP/V-JEPA verification for labels and alerts.
@@ -565,7 +568,35 @@ export default function CameraTile({ cam }) {
   const showBoxesRef = useRef(showBoundingBoxes);
   const backendBoxesRef = useRef(Array.isArray(cam.boxes) ? cam.boxes : []);
   const backendCanvasRef = useRef(null);
-  const boxClearTimerRef = useRef(null);
+  const forceClearOverlayRef = useRef(false); // set true to wipe YOLO overlay on next rAF tick
+  // Tracks backend static-rejection state without recreating the onDetections closure
+  const staticRejectedRef = useRef(cam.staticRejected || false);
+  // Miss-streak debounce: require N consecutive frames with no detection before clearing.
+  // Prevents brief YOLO misses (compression artifact, motion blur) from flickering the label.
+  const missStreakRef = useRef(0);
+  const MISS_STREAK_CLEAR = 5; // ~250ms at 50ms throttle
+  const lastFireBoxRef = useRef(null);
+  const movingFireFramesRef = useRef(0);
+
+  const boxIouRef = useCallback((a, b) => {
+    if (!a || !b) return 0;
+    const ix1 = Math.max(a[0], b[0]), iy1 = Math.max(a[1], b[1]);
+    const ix2 = Math.min(a[2], b[2]), iy2 = Math.min(a[3], b[3]);
+    const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+    const areaA = Math.max(0, a[2] - a[0]) * Math.max(0, a[3] - a[1]);
+    const areaB = Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1]);
+    return inter / (areaA + areaB - inter || 1);
+  }, []);
+
+  const centerShiftRef = useCallback((a, b) => {
+    if (!a || !b) return 0;
+    const cx1 = (a[0] + a[2]) / 2, cy1 = (a[1] + a[3]) / 2;
+    const cx2 = (b[0] + b[2]) / 2, cy2 = (b[1] + b[3]) / 2;
+    const w = ((a[2] - a[0]) + (b[2] - b[0])) / 2;
+    const h = ((a[3] - a[1]) + (b[3] - b[1])) / 2;
+    const diag = Math.sqrt(w * w + h * h) || 1;
+    return Math.sqrt((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2) / diag;
+  }, []);
 
   useEffect(() => {
     showBoxesRef.current = showBoundingBoxes;
@@ -575,8 +606,14 @@ export default function CameraTile({ cam }) {
     backendBoxesRef.current = Array.isArray(cam.boxes) ? cam.boxes : [];
   }, [cam.boxes]);
 
+  useEffect(() => {
+    staticRejectedRef.current = cam.staticRejected || false;
+    setStaticNotice(cam.staticRejected || false);
+  }, [cam.staticRejected]);
+
   const getOverlayBoxes = (localBoxes = []) => {
-    return localBoxes && localBoxes.length > 0 ? localBoxes : backendBoxesRef.current;
+    if (localBoxes && localBoxes.length > 0) return localBoxes;
+    return cam.isFire ? backendBoxesRef.current : [];
   };
 
   // Sync the backend canvas to the actual rendered video content area (letterbox-aware)
@@ -630,62 +667,26 @@ export default function CameraTile({ cam }) {
     };
   }, [syncBackendCanvas]);
 
-  // Draw backend boxes whenever boxes or visibility toggle changes
+  // Backend boxes are never drawn — frontend YOLO is the sole source of bounding boxes.
+  // Backend communicates labels and static-rejection state via WebSocket; cam.boxes is
+  // kept in state for potential future use but never rendered.
   useEffect(() => {
     const canvas = backendCanvasRef.current;
     if (!canvas) return;
     syncBackendCanvas();
-    const ctx = canvas.getContext("2d");
-
-    const drawBoxes = (boxes) => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      if (!showBoundingBoxes || !boxes?.length) return;
-      for (const box of boxes) {
-        const [x1, y1, x2, y2, label, conf] = box;
-        const lbl = String(label || "");
-        let color = "#f97316";
-        if (lbl.toLowerCase().includes("smoke"))   color = "#ffb86c";
-        else if (lbl.toLowerCase() === "fire")     color = "#ef4444";
-
-        const bw = 3;
-        ctx.strokeStyle = color;
-        ctx.lineWidth   = bw;
-        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-
-        const text = `${lbl} ${conf != null ? `${(conf * 100).toFixed(0)}%` : ""}`.trim();
-        const fontSize = Math.max(14, Math.round(canvas.height / 50));
-        ctx.font = `bold ${fontSize}px sans-serif`;
-        const textW = ctx.measureText(text).width;
-        ctx.fillStyle = color;
-        ctx.fillRect(x1, y1 - fontSize - 6, textW + 8, fontSize + 6);
-        ctx.fillStyle = "#000";
-        ctx.fillText(text, x1 + 4, y1 - 4);
-      }
-    };
-
-    // Cancel any pending auto-clear
-    if (boxClearTimerRef.current) {
-      clearTimeout(boxClearTimerRef.current);
-      boxClearTimerRef.current = null;
-    }
-
-    drawBoxes(cam.boxes);
-
-    // Auto-clear stale boxes after 8 s if no new update arrives
-    if (cam.boxes?.length) {
-      boxClearTimerRef.current = setTimeout(() => {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        boxClearTimerRef.current = null;
-      }, 8000);
-    }
-
-    return () => {
-      if (boxClearTimerRef.current) {
-        clearTimeout(boxClearTimerRef.current);
-        boxClearTimerRef.current = null;
-      }
-    };
+    canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
   }, [cam.boxes, showBoundingBoxes, syncBackendCanvas]);
+
+  // When backend clears fire, wipe both canvases immediately — don't wait for next cycle
+  useEffect(() => {
+    if (!cam.isFire) {
+      forceClearOverlayRef.current = true;
+      backendBoxesRef.current = [];
+      setAlertType(null);
+      const bc = backendCanvasRef.current;
+      if (bc) bc.getContext("2d").clearRect(0, 0, bc.width, bc.height);
+    }
+  }, [cam.isFire]);
 
   const logWorkerError = (label, event) => {
     const detail = {
@@ -704,6 +705,9 @@ export default function CameraTile({ cam }) {
     if (isStartLocalDetection) {
       updates.isFire    = isFire;
       updates.alertType = alertType;
+      // When local YOLO clears, also wipe the backend's persistentLabel so it doesn't
+      // outlast detection. Backend will re-set it within its next cycle if threat is real.
+      if (!isFire) updates.persistentLabel = null;
     }
     updateCameraStatus(cam.id, updates);
   }, [isFire, isStreaming, alertType, cam.id, updateCameraStatus]);
@@ -931,17 +935,60 @@ export default function CameraTile({ cam }) {
           id: cam.name,
           mount: null,
           workerUrl: "../utils/worker-client.js",
-          throttleMs: 80,
+          throttleMs: 50,  // ~20fps draw rate; inference still runs back-to-back via onmessage
           onDetections: (boxes) => {
             if (cancelled) return;
             const any = boxes && boxes.length > 0;
-            setIsFire(any);
             if (any) {
-              const topWeapon = boxes.find(b => b[4] === "Knife");
-              const hasFire   = boxes.some(b => b[4] === "Fire" || b[4] === "Smoke");
-              setAlertType(topWeapon ? topWeapon[4] : hasFire ? "Fire" : null);
+              missStreakRef.current = 0;
+              setIsFire(true);
+              const topWeapon = boxes.find(b => b[4] === "Knife" || b[4] === "knife");
+              const hasFire   = boxes.some(b => b[4] === "Fire");
+              const hasSmoke  = boxes.some(b => b[4] === "Smoke");
+              const hasMask   = boxes.some(b => b[4] === "with_mask" || b[4] === "mask_weared_incorrect");
+              setLiveMaskPresent(hasMask);
+              const fireSmokeBoxes = boxes.filter(b => b[4] === "Fire" || b[4] === "Smoke");
+              const currentFireBox = fireSmokeBoxes[0] || null;
+              const previousFireBox = lastFireBoxRef.current;
+              if (currentFireBox && previousFireBox) {
+                const iou = boxIouRef(previousFireBox, currentFireBox);
+                const shift = centerShiftRef(previousFireBox, currentFireBox);
+                movingFireFramesRef.current = (iou < 0.55 || shift > 0.12)
+                  ? movingFireFramesRef.current + 1
+                  : 0;
+              }
+              lastFireBoxRef.current = currentFireBox;
+
+              if (hasFire) {
+                setAlertType("Active fire detected in the scene");
+              }
+              else if (hasSmoke) {
+                setAlertType("Smoke detected in the scene");
+              }
+              else if (topWeapon) {
+                setAlertType("Someone carrying a knife or bladed weapon");
+              }
+              else if (hasMask) {
+                setAlertType("Suspicious — person wearing a face mask");
+              }
+              else {
+                setAlertType(null);
+              }
             } else {
-              setAlertType(null);
+              // Require N consecutive miss frames before clearing — prevents flicker
+              // from brief YOLO misses (motion blur, compression artifacts, partial occlusion).
+              missStreakRef.current++;
+              if (missStreakRef.current >= MISS_STREAK_CLEAR) {
+                lastFireBoxRef.current = null;
+                movingFireFramesRef.current = 0;
+                if (staticRejectedRef.current) {
+                  staticRejectedRef.current = false;
+                  updateCameraStatus(cam.id, { staticRejected: false });
+                }
+                setIsFire(false);
+                setLiveMaskPresent(false);
+                setAlertType(null);
+              }
             }
           },
         });
@@ -1013,16 +1060,22 @@ export default function CameraTile({ cam }) {
 
         detectorRef.current = d;
 
-        // Always run both fire and weapon workers — real-time boxes for everything.
-        const needsFire   = true;
-        const needsWeapon = true;
+        // Run local workers for realtime boxes. Backend still confirms alert state.
+        const aiType      = cam.aiType || "FIRE";
+        const needsFire   = aiType === "FIRE";
+        const needsWeapon = aiType === "WEAPON";
+        const needsMask   = aiType === "MASK";
 
         // Start the detector (spawn worker(s) and bind video loop)
         // DON'T call attachWebRTC or start() since we're manually managing video/canvas
-        if (needsFire && needsWeapon) {
-          // === BOTH mode: two workers running simultaneously ===
-          let fireBusy = false, weaponBusy = false;
-          let fireBoxes = [], weaponBoxes = [];
+        if (needsFire && needsWeapon && needsMask) {
+          // === Multi-worker mode: fire, weapon, and mask workers running simultaneously ===
+          let fireBusy = false, weaponBusy = false, maskBusy = false;
+          let fireBoxes = [], weaponBoxes = [], maskBoxes = [];
+          let weaponMisses = 0;
+          let maskMisses = 0;
+          const WEAPON_MISS_HOLD_FRAMES = 4;
+          const MASK_MISS_HOLD_FRAMES = 2;
           let boxesDirty = false; // flag to call onDetections only when results arrive
 
           const fireWorker = new Worker(
@@ -1033,32 +1086,140 @@ export default function CameraTile({ cam }) {
             weaponWorkerUrl,
             { type: "module", name: `${cam.name}-weapon` }
           );
+          const maskWorker = new Worker(
+            maskWorkerUrl,
+            { type: "module", name: `${cam.name}-mask` }
+          );
 
           fireWorker.onmessage = (evt) => {
-            fireBoxes = d._processOutput(evt.data, d._overlay.width, d._overlay.height);
-            fireBusy = false;
+            const msg = evt.data;
+            const output = msg && msg.data ? msg.data : msg;
+            const dims = msg && msg.dims ? msg.dims : null;
+            fireBoxes = d._processOutput(output, d._overlay.width, d._overlay.height, dims);
             boxesDirty = true;
+            // Immediately queue next frame so inference runs back-to-back
+            // instead of waiting up to throttleMs for the next animation tick.
+            if (d._video && d._overlay && d._video.videoWidth > 0) {
+              const buf = d._prepareInput(d._video);
+              if (buf) {
+                fireWorker.postMessage(
+                  { type: "infer", data: buf, dims: [1, 3, d.modelInputSize, d.modelInputSize] },
+                  [buf]
+                );
+                fireBusy = true;
+              } else {
+                fireBusy = false;
+              }
+            } else {
+              fireBusy = false;
+            }
           };
           fireWorker.onerror = (e) => {
+            fireBusy = false;
             logWorkerError("Fire", e);
           };
 
           weaponWorker.onmessage = (evt) => {
-            weaponBoxes = d._processOutputWeapon(evt.data, d._overlay.width, d._overlay.height);
-            weaponBusy = false;
+            const nextWeaponBoxes = d._processOutputWeapon(evt.data, d._overlay.width, d._overlay.height);
+            if (nextWeaponBoxes.length > 0) {
+              weaponBoxes = nextWeaponBoxes;
+              weaponMisses = 0;
+            } else if (weaponBoxes.length > 0 && weaponMisses < WEAPON_MISS_HOLD_FRAMES) {
+              weaponMisses++;
+            } else {
+              weaponBoxes = [];
+              weaponMisses = 0;
+            }
             boxesDirty = true;
+            // Immediately queue next frame so inference runs back-to-back.
+            if (d._video && d._overlay && d._video.videoWidth > 0) {
+              const buf = d._prepareInput(d._video);
+              if (buf) {
+                weaponWorker.postMessage(
+                  { type: "infer", data: buf, dims: [1, 3, d.modelInputSize, d.modelInputSize] },
+                  [buf]
+                );
+                weaponBusy = true;
+              } else {
+                weaponBusy = false;
+              }
+            } else {
+              weaponBusy = false;
+            }
           };
           weaponWorker.onerror = (e) => {
+            weaponBusy = false;
             logWorkerError("Weapon", e);
+          };
+
+          maskWorker.onmessage = (evt) => {
+            const nextMaskBoxes = d._processOutputMask(evt.data, d._overlay.width, d._overlay.height);
+            if (nextMaskBoxes.length > 0) {
+              maskBoxes = nextMaskBoxes;
+              maskMisses = 0;
+            } else if (maskBoxes.length > 0 && maskMisses < MASK_MISS_HOLD_FRAMES) {
+              maskMisses++;
+            } else {
+              maskBoxes = [];
+              maskMisses = 0;
+            }
+            boxesDirty = true;
+            if (d._video && d._overlay && d._video.videoWidth > 0) {
+              const buf = d._prepareInput(d._video);
+              if (buf) {
+                maskWorker.postMessage(
+                  { type: "infer", data: buf, dims: [1, 3, d.modelInputSize, d.modelInputSize] },
+                  [buf]
+                );
+                maskBusy = true;
+              } else {
+                maskBusy = false;
+              }
+            } else {
+              maskBusy = false;
+            }
+          };
+          maskWorker.onerror = (e) => {
+            maskBusy = false;
+            logWorkerError("Mask", e);
           };
 
           d._worker = fireWorker;
           d._weaponWorker = weaponWorker;
+          d._maskWorker = maskWorker;
 
-          console.log(`[${cam.name}] Both fire + weapon workers created`);
+          console.log(`[${cam.name}] Fire + weapon + mask workers created`);
 
           // Bind video loop for BOTH mode
           if (!d._rafHandle) {
+            let smoothedBoxes = []; // EMA-smoothed box positions to reduce per-frame jitter
+            const SMOOTH_ALPHA = 0.35; // 0=never update, 1=no smoothing
+            const boxIou = (a, b) => {
+              const ix1 = Math.max(a[0], b[0]), iy1 = Math.max(a[1], b[1]);
+              const ix2 = Math.min(a[2], b[2]), iy2 = Math.min(a[3], b[3]);
+              const inter = Math.max(0, ix2 - ix1) * Math.max(0, iy2 - iy1);
+              const areaA = (a[2] - a[0]) * (a[3] - a[1]);
+              const areaB = (b[2] - b[0]) * (b[3] - b[1]);
+              return inter / (areaA + areaB - inter + 1e-6);
+            };
+            const smoothBoxes = (rawBoxes) => {
+              if (!smoothedBoxes.length) return (smoothedBoxes = rawBoxes.map(b => [...b]));
+              const next = rawBoxes.map(raw => {
+                const match = smoothedBoxes.find(s => s[4] === raw[4] && boxIou(s, raw) > 0.3);
+                if (!match) return [...raw];
+                const alpha = raw[4] === "Knife" ? 0.85 : SMOOTH_ALPHA;
+                return [
+                  match[0] + alpha * (raw[0] - match[0]),
+                  match[1] + alpha * (raw[1] - match[1]),
+                  match[2] + alpha * (raw[2] - match[2]),
+                  match[3] + alpha * (raw[3] - match[3]),
+                  raw[4], raw[5],
+                ];
+              });
+              smoothedBoxes = next;
+              return next;
+            };
+
             const tick = (t) => {
               d._rafHandle = requestAnimationFrame(tick);
               if (t - d._lastTick < d.throttleMs) return;
@@ -1067,8 +1228,23 @@ export default function CameraTile({ cam }) {
               if (!d._video || !d._overlay) return;
               if (d._video.videoWidth === 0 || d._video.videoHeight === 0) return;
 
-              // Merge boxes from both models and draw
-              d._boxes = [...fireBoxes, ...weaponBoxes];
+              // Force-clear overlay when backend confirms the active alert is gone
+              if (forceClearOverlayRef.current) {
+                forceClearOverlayRef.current = false;
+                fireBoxes = []; weaponBoxes = []; maskBoxes = [];
+                smoothedBoxes = []; weaponMisses = 0; maskMisses = 0;
+              }
+
+              // Merge boxes from local models, apply temporal smoothing
+              const rawBoxes = [...fireBoxes, ...weaponBoxes, ...maskBoxes];
+              d._boxes = smoothBoxes(rawBoxes);
+              // Always clear backend canvas — YOLO overlay is the live source of truth.
+              // Backend boxes are 3s stale and redundant when YOLO runs at 20fps.
+              if (backendCanvasRef.current) {
+                backendCanvasRef.current.getContext("2d").clearRect(
+                  0, 0, backendCanvasRef.current.width, backendCanvasRef.current.height
+                );
+              }
               const overlayBoxes = getOverlayBoxes(d._boxes);
               d._ctx.clearRect(0, 0, d._overlay.width, d._overlay.height);
               if (showBoxesRef.current) {
@@ -1085,8 +1261,7 @@ export default function CameraTile({ cam }) {
               const buffer = d._prepareInput(d._video);
               if (!buffer) return;
 
-              // Both workers need the same input — copy for the second
-              if (!fireBusy || !weaponBusy) {
+              if (!fireBusy || !weaponBusy || !maskBusy) {
                 const shared = new Float32Array(buffer);
                 if (!fireBusy) {
                   const copy = shared.buffer.slice(0);
@@ -1103,6 +1278,14 @@ export default function CameraTile({ cam }) {
                     [copy]
                   );
                   weaponBusy = true;
+                }
+                if (!maskBusy) {
+                  const copy = shared.buffer.slice(0);
+                  maskWorker.postMessage(
+                    { type: "infer", data: copy, dims: [1, 3, d.modelInputSize, d.modelInputSize] },
+                    [copy]
+                  );
+                  maskBusy = true;
                 }
               }
             };
@@ -1123,7 +1306,9 @@ export default function CameraTile({ cam }) {
           if (!d._worker) {
             const workerUrl = needsWeapon
               ? weaponWorkerUrl
-              : fireWorkerUrl;
+              : needsMask
+                ? maskWorkerUrl
+                : fireWorkerUrl;
 
             d._worker = new Worker(
               workerUrl,
@@ -1131,26 +1316,57 @@ export default function CameraTile({ cam }) {
             );
 
             let firstResponse = true;
+            let singleMissStreak = 0;
+            const SINGLE_WEAPON_HOLD = 8; // hold weapon/mask boxes for 8 missed frames before clearing
             d._worker.onmessage = (evt) => {
-              const output = evt.data;
-              if (firstResponse) {
-                firstResponse = false;
-                console.log(`[${cam.name}] First inference response received — model loaded OK, output length: ${output.length}, canvas: ${d._overlay.width}x${d._overlay.height}`);
+              const msg = evt.data;
+
+              let fresh;
+              if (needsWeapon && msg && typeof msg === "object" && "newOut" in msg) {
+                // Dual-model weapon response: merge boxes from both models
+                const W = d._overlay.width, H = d._overlay.height;
+                const newBoxes = d._processOutputWeapon(msg.newOut, W, H);
+                const legacyBoxes = d._processOutputWeaponLegacy(msg.legacyOut, W, H);
+                if (firstResponse) {
+                  firstResponse = false;
+                  console.log(`[${cam.name}] Weapon dual-model loaded — knife_yolov8n boxes: ${newBoxes.length}, weapons_yolo boxes: ${legacyBoxes.length}`);
+                } else if (Math.random() < 0.05) {
+                  console.log(`[${cam.name}] knife_yolov8n: ${newBoxes.length} (conf ${newBoxes[0]?.[5]?.toFixed(2) ?? "—"}) | weapons_yolo: ${legacyBoxes.length} (conf ${legacyBoxes[0]?.[5]?.toFixed(2) ?? "—"})`);
+                }
+                fresh = [...newBoxes, ...legacyBoxes];
+              } else {
+                const output = msg && msg.data ? msg.data : msg;
+                const dims = msg && msg.dims ? msg.dims : null;
+                if (firstResponse) {
+                  firstResponse = false;
+                  console.log(`[${cam.name}] First inference response — output length: ${output?.length}, dims: [${dims || []}], canvas: ${d._overlay.width}x${d._overlay.height}`);
+                }
+                fresh = needsMask
+                  ? d._processOutputMask(output, d._overlay.width, d._overlay.height)
+                  : d._processOutput(output, d._overlay.width, d._overlay.height, dims);
               }
-              d._boxes = needsWeapon
-                ? d._processOutputWeapon(output, d._overlay.width, d._overlay.height)
-                : d._processOutput(output, d._overlay.width, d._overlay.height);
+
+              if (fresh.length > 0) {
+                singleMissStreak = 0;
+                d._boxes = fresh;
+              } else if ((needsWeapon || needsMask) && d._boxes.length > 0 && singleMissStreak < SINGLE_WEAPON_HOLD) {
+                singleMissStreak++;
+                // keep d._boxes from previous frame — don't update
+              } else {
+                singleMissStreak = 0;
+                d._boxes = fresh;
+              }
               d.onDetections(d._boxes);
               d._busy = false;
             };
 
             d._worker.onerror = (e) => {
-              logWorkerError(needsWeapon ? "Weapon" : "Fire", e);
+              logWorkerError(needsWeapon ? "Weapon" : needsMask ? "Mask" : "Fire", e);
               d._worker = null;
               d._busy = false; // Reset so loop doesn't get stuck
             };
 
-            console.log(`[${cam.name}] ${needsWeapon ? "Weapon" : "Fire"} worker created`);
+            console.log(`[${cam.name}] ${needsWeapon ? "Weapon" : needsMask ? "Mask" : "Fire"} worker created`);
           }
 
           // Bind video loop for single model
@@ -1171,6 +1387,13 @@ export default function CameraTile({ cam }) {
 
               // Clear canvas and draw only boxes (NOT the video)
               d._ctx.clearRect(0, 0, d._overlay.width, d._overlay.height);
+
+              // Frontend YOLO is the authoritative source of bounding boxes — keep backend canvas clear
+              if (backendCanvasRef.current) {
+                backendCanvasRef.current.getContext("2d").clearRect(
+                  0, 0, backendCanvasRef.current.width, backendCanvasRef.current.height
+                );
+              }
 
               if (showBoxesRef.current) {
                 d._drawBoxes(getOverlayBoxes(d._boxes));
@@ -1274,10 +1497,14 @@ export default function CameraTile({ cam }) {
 
       if (detectorRef.current) {
         try {
-          // Terminate weapon worker if it exists (BOTH mode)
+          // Terminate extra workers if they exist (multi-worker mode)
           if (detectorRef.current._weaponWorker) {
             detectorRef.current._weaponWorker.terminate();
             detectorRef.current._weaponWorker = null;
+          }
+          if (detectorRef.current._maskWorker) {
+            detectorRef.current._maskWorker.terminate();
+            detectorRef.current._maskWorker = null;
           }
           // Remove overlay canvas if it exists
           if (
@@ -1318,6 +1545,7 @@ export default function CameraTile({ cam }) {
     cam.webrtcBase,
     cam.streamName,
     cam.detection,
+    cam.aiType,
   ]);
 
   const displayFireStatus = cam.isFire || isFire;
@@ -1326,7 +1554,15 @@ export default function CameraTile({ cam }) {
   // Fire-started: "Active fire detected in the scene" (from CLIP verify)
   // Fire-clear: CLIP describes why ("Camera moved away from the fire source", etc.)
   // Behavioral: CLIP sentence labels ("Someone carrying a knife...", etc.)
-  const rawLabel = cam.persistentLabel || (displayFireStatus ? (alertType || cam.alertType) : null);
+  const localLabel = displayFireStatus ? alertType : null;
+  const backendLabel = displayFireStatus ? (cam.persistentLabel || cam.alertType) : null;
+  const backendLabelIsMask = typeof backendLabel === "string" &&
+    /mask|face|balaclava/i.test(backendLabel);
+  const rawLabel = localLabel
+    ? localLabel
+    : backendLabelIsMask && !liveMaskPresent
+      ? null
+      : backendLabel;
   const displayLabel = rawLabel || null;
 
   // Map label to CSS colour

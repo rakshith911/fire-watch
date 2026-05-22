@@ -2,10 +2,10 @@ import fs from "node:fs/promises";
 import path from "path";
 import os from "node:os";
 import yaml from "js-yaml";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 import { dynamodb } from "../db/dynamodb.js";
 
-const log = pino({ name: "mediamtx-config-generator" });
+const log = makeLogger("mediamtx-config-generator");
 
 /**
  * Generates mediamtx.yml configuration file dynamically from DynamoDB cameras

@@ -1,23 +1,40 @@
 import * as ort from "onnxruntime-node";
 import sharp from "sharp";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
-import pino from "pino";
+import { makeLogger } from "../logger.js";
 import { grabFrameOnce, grabMultipleFrames } from "./localDetector.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const log = pino({ name: "local-yolo-detector" });
+const log = makeLogger("local-yolo-detector");
+const KNIFE_CONFIDENCE_THRESHOLD = 0.40;
 
 let fireSessionPromise = null;
 let weaponSessionPromise = null;
+let weaponLegacySessionPromise = null;
+let maskSessionPromise = null;
 
 function getModelsDir() {
   return process.env.MODELS_DIR_OVERRIDE || path.resolve(__dirname, "../../models");
 }
 
+function resolveModelPath(modelFile) {
+  const configuredPath = path.join(getModelsDir(), modelFile);
+  if (fs.existsSync(configuredPath)) return configuredPath;
+
+  const bundledPath = path.resolve(__dirname, "../../models", modelFile);
+  if (configuredPath !== bundledPath && fs.existsSync(bundledPath)) {
+    log.warn({ configuredPath, bundledPath, modelFile }, "Configured model missing — using bundled fallback");
+    return bundledPath;
+  }
+
+  return configuredPath;
+}
+
 function getFireSession() {
   if (!fireSessionPromise) {
-    const modelPath = path.join(getModelsDir(), "yolov11n_bestFire.onnx");
+    const modelPath = resolveModelPath("scaled_yolov4_p5_fire.onnx");
     log.info({ modelPath }, "Loading Fire YOLO model...");
     fireSessionPromise = ort.InferenceSession.create(modelPath, {
       executionProviders: ["cpu"],
@@ -35,20 +52,56 @@ function getFireSession() {
 
 function getWeaponSession() {
   if (!weaponSessionPromise) {
-    const modelPath = path.join(getModelsDir(), "weapons_yolo.onnx");
-    log.info({ modelPath }, "Loading Weapon YOLO model...");
+    const modelPath = resolveModelPath("knife_yolov8n.onnx");
+    log.info({ modelPath }, "Loading Knife YOLOv8n model...");
     weaponSessionPromise = ort.InferenceSession.create(modelPath, {
       executionProviders: ["cpu"],
     }).then((session) => {
-      log.info({ inputNames: session.inputNames, outputNames: session.outputNames }, "✅ Weapon YOLO session ready");
+      log.info({ inputNames: session.inputNames, outputNames: session.outputNames }, "✅ Knife YOLOv8n session ready");
       return session;
     }).catch((err) => {
       weaponSessionPromise = null;
-      log.error({ error: err.message, modelPath }, "❌ Failed to load Weapon YOLO model");
+      log.error({ error: err.message, modelPath }, "❌ Failed to load Knife YOLOv8n model");
       throw err;
     });
   }
   return weaponSessionPromise;
+}
+
+function getWeaponLegacySession() {
+  if (!weaponLegacySessionPromise) {
+    const modelPath = resolveModelPath("weapons_yolo.onnx");
+    log.info({ modelPath }, "Loading Knife legacy YOLO model...");
+    weaponLegacySessionPromise = ort.InferenceSession.create(modelPath, {
+      executionProviders: ["cpu"],
+    }).then((session) => {
+      log.info({ inputNames: session.inputNames, outputNames: session.outputNames }, "✅ Knife legacy session ready");
+      return session;
+    }).catch((err) => {
+      weaponLegacySessionPromise = null;
+      log.warn({ error: err.message, modelPath }, "⚠️ Failed to load Knife legacy model — skipping");
+      return null;
+    });
+  }
+  return weaponLegacySessionPromise;
+}
+
+function getMaskSession() {
+  if (!maskSessionPromise) {
+    const modelPath = resolveModelPath("mask_yolov5.onnx");
+    log.info({ modelPath }, "Loading Mask YOLO model...");
+    maskSessionPromise = ort.InferenceSession.create(modelPath, {
+      executionProviders: ["cpu"],
+    }).then((session) => {
+      log.info({ inputNames: session.inputNames, outputNames: session.outputNames }, "✅ Mask YOLO session ready");
+      return session;
+    }).catch((err) => {
+      maskSessionPromise = null;
+      log.error({ error: err.message, modelPath }, "❌ Failed to load Mask YOLO model");
+      throw err;
+    });
+  }
+  return maskSessionPromise;
 }
 
 async function prepareInput(jpegBuffer, modelInputSize = 640) {
@@ -120,38 +173,55 @@ function nms(boxes, threshold, iouThreshold = 0.45) {
 }
 
 function processYoloOutput(outputs, originalWidth, originalHeight, scale, padX, padY, classNames, options = {}) {
-  const output = outputs[Object.keys(outputs)[0]];
+  // Prefer the named "output" tensor; fall back to first key for other models
+  const output = outputs["output"] ?? outputs[Object.keys(outputs)[0]];
   const data = output.data;
   const dims = output.dims;
-  const channels = dims[1];
-  const anchors = dims[2];
-  const classes = channels - 4;
+  if (!Array.isArray(dims) || dims.length !== 3) {
+    throw new Error(`Unsupported YOLO output shape: ${JSON.stringify(dims)}`);
+  }
+
+  const anchorFirst = dims[2] <= 128 && dims[1] > dims[2];
+  const channels = anchorFirst ? dims[2] : dims[1];
+  const anchors = anchorFirst ? dims[1] : dims[2];
+  const hasObjectness = options.hasObjectness ?? (channels === classNames.length + 5);
+  const classes = channels - (hasObjectness ? 5 : 4);
   const prefilter = options.prefilter ?? 0.10;
   const threshold = options.threshold ?? 0.35;
   const allowedLabels = options.allowedLabels || classNames;
 
+  const valueAt = (channel, anchor) => anchorFirst
+    ? data[anchor * channels + channel]
+    : data[channel * anchors + anchor];
+
   const raw = [];
   const topScores = [];
   for (let i = 0; i < anchors; i++) {
+    const objectness = hasObjectness ? valueAt(4, i) : 1;
+    if (objectness < prefilter) continue;
+
     let bestScore = 0;
     let bestClass = -1;
     for (let c = 0; c < classes; c++) {
-      const score = data[(4 + c) * anchors + i];
+      const classOffset = hasObjectness ? 5 : 4;
+      const score = objectness * valueAt(classOffset + c, i);
       if (score > bestScore) {
         bestScore = score;
         bestClass = c;
       }
     }
 
-    const label = classNames[bestClass] || `Unknown(${bestClass})`;
+    const label = classes === 1 && options.singleClassLabel
+      ? options.singleClassLabel
+      : classNames[bestClass] || `Unknown(${bestClass})`;
     if (bestScore > 0.10) topScores.push({ score: bestScore, label });
     if (bestScore < prefilter || !allowedLabels.includes(label)) continue;
 
     raw.push([
-      data[i],
-      data[anchors + i],
-      data[2 * anchors + i],
-      data[3 * anchors + i],
+      valueAt(0, i),
+      valueAt(1, i),
+      valueAt(2, i),
+      valueAt(3, i),
       bestScore,
       bestClass,
     ]);
@@ -183,7 +253,7 @@ export async function detectFireYolo(cameraUrl, cameraName) {
   try {
     const session = await getFireSession();
     const frameBuffer = await grabFrameOnce(cameraUrl);
-    const boxes = await runYolo(session, frameBuffer, ["Fire", "Smoke", "Other"], {
+    const boxes = await runYolo(session, frameBuffer, ["Fire", "Smoke"], {
       threshold: 0.25,
       allowedLabels: ["Fire", "Smoke"],
     });
@@ -251,22 +321,87 @@ export async function detectFireMultiFrameYolo(cameraUrl, cameraName, numFrames 
 
 export async function detectWeaponYolo(cameraUrl, cameraName) {
   try {
-    const session = await getWeaponSession();
-    const frameBuffer = await grabFrameOnce(cameraUrl);
-    const boxes = await runYolo(session, frameBuffer, ["Knife", "Pistol", "Rifle"], {
-      threshold: 0.50,
-      allowedLabels: ["Knife"],
-    });
+    const [session, legacySession, frameBuffer] = await Promise.all([
+      getWeaponSession(),
+      getWeaponLegacySession(),
+      grabFrameOnce(cameraUrl),
+    ]);
+
+    const [newBoxes, legacyBoxes] = await Promise.all([
+      runYolo(session, frameBuffer, ["Gun", "explosion", "grenade", "knife"], {
+        threshold: KNIFE_CONFIDENCE_THRESHOLD,
+        allowedLabels: ["knife"],
+        singleClassLabel: "knife",
+      }).then((boxes) => boxes.map((b) => [b[0], b[1], b[2], b[3], "knife", b[5]])),
+      legacySession
+        ? runYolo(legacySession, frameBuffer, ["Knife", "Pistol"], {
+            threshold: KNIFE_CONFIDENCE_THRESHOLD,
+            allowedLabels: ["Knife"],
+            singleClassLabel: "Knife",
+          }).then((boxes) => boxes.map((b) => [b[0], b[1], b[2], b[3], "Knife", b[5]]))
+        : Promise.resolve([]),
+    ]);
+
+    log.info({
+      camera: cameraName,
+      "knife_yolov8n.detected": newBoxes.length,
+      "knife_yolov8n.topConf": newBoxes[0]?.[5]?.toFixed(3) || "—",
+      "weapons_yolo.detected": legacyBoxes.length,
+      "weapons_yolo.topConf": legacyBoxes[0]?.[5]?.toFixed(3) || "—",
+    }, "🔫 Knife dual-model comparison");
+
+    // Merge boxes from both models — deduplicate overlapping ones via NMS
+    const allBoxes = [...newBoxes, ...legacyBoxes];
+    const best = allBoxes.length > 0 ? allBoxes.reduce((a, b) => (b[5] > a[5] ? b : a)) : null;
+
     return {
-      isWeapon: boxes.length > 0,
-      confidence: boxes[0]?.[5] || 0,
-      boxes,
+      isWeapon: allBoxes.length > 0,
+      confidence: best?.[5] || 0,
+      boxes: allBoxes,
       frameBuffer,
     };
   } catch (error) {
     log.error({ camera: cameraName, error: error.message }, "🔫 YOLO Weapon detection failed");
     return {
       isWeapon: false,
+      confidence: 0,
+      boxes: [],
+      frameBuffer: null,
+      error: error.message,
+      transientReadError: true,
+    };
+  }
+}
+
+export async function detectMaskYolo(cameraUrl, cameraName, frameBuffer = null) {
+  try {
+    const session = await getMaskSession();
+    const buffer = frameBuffer || await grabFrameOnce(cameraUrl);
+    const boxes = await runYolo(session, buffer, ["with_mask", "without_mask", "mask_weared_incorrect"], {
+      threshold: 0.75,
+      prefilter: 0.20,
+      hasObjectness: true,
+      allowedLabels: ["with_mask", "mask_weared_incorrect"],
+    });
+
+    log.info({
+      camera: cameraName,
+      detected: boxes.length > 0,
+      boxes: boxes.length,
+      topScore: boxes[0]?.[5]?.toFixed?.(4) || "0",
+      topLabel: boxes[0]?.[4] || null,
+    }, "🎭 YOLO Mask result");
+
+    return {
+      isMask: boxes.length > 0,
+      confidence: boxes[0]?.[5] || 0,
+      boxes,
+      frameBuffer: buffer,
+    };
+  } catch (error) {
+    log.error({ camera: cameraName, error: error.message }, "🎭 YOLO Mask detection failed");
+    return {
+      isMask: false,
       confidence: 0,
       boxes: [],
       frameBuffer: null,

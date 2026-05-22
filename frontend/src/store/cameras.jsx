@@ -153,7 +153,7 @@ function threatCategory(alertType) {
   const t = alertType.toLowerCase();
   if (t.includes("smoke")) return "smoke";
   if (t.includes("large") || t.includes("big")) return "large_fire";
-  if (t.includes("fire")) return "small_fire";
+  if (t.includes("fire")) return "fire";
   if (t.includes("threat") || t.includes("weapon") || t.includes("knife")) return "weapon_threat";
   if (t.includes("weapon") || t.includes("knife")) return "weapon";
   if (t.includes("face") || t.includes("mask")) return "face_covered";
@@ -476,6 +476,7 @@ export function CamerasProvider({ children }) {
         alertType: cameraStatuses[cam.id]?.alertType || null,
         persistentLabel: cameraStatuses[cam.id]?.persistentLabel || null,
         boxes: cameraStatuses[cam.id]?.boxes || [],
+        staticRejected: cameraStatuses[cam.id]?.staticRejected || false,
         detectionHistory: cameraHistory[cam.id] || [],
       }));
       console.log(`[Camera Store] 📹 camerasWithStatus recomputed:`,
