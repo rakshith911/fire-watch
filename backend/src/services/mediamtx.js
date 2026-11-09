@@ -24,8 +24,10 @@ function getConfigPath() {
   const isElectron = process.env.ELECTRON === 'true';
 
   if (isElectron) {
-    // ✅ Use user's home directory for Electron
-    const userDataPath = path.join(os.homedir(), '.firewatch');
+    // Keep generated state inside Electron's user-data directory when supplied.
+    const userDataPath = process.env.DATA_DIR_OVERRIDE
+      ? path.resolve(process.env.DATA_DIR_OVERRIDE)
+      : path.join(os.homedir(), '.firewatch');
 
     // Create directory if it doesn't exist
     if (!fs.existsSync(userDataPath)) {

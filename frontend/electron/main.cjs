@@ -162,8 +162,35 @@ const versionFilePath = path.join(userDataPath, ".app_version");
 ensureDir(modelsPath);
 ensureDir(backendRootPath);
 
+// Public installers bundle MediaMTX from the official release. Copy it into
+// userData so the generated configuration remains writable and upgrades can
+// replace the binary without modifying the installed application.
+function installBundledRuntime() {
+  if (isDev) return;
+
+  const binaryName = process.platform === "win32" ? "mediamtx.exe" : "mediamtx";
+  const bundledPath = path.join(process.resourcesPath, "runtime", binaryName);
+  const installedPath = path.join(backendRootPath, binaryName);
+
+  if (!fs.existsSync(bundledPath)) {
+    throw new Error(`Bundled runtime is missing: ${bundledPath}`);
+  }
+
+  const bundledSize = fs.statSync(bundledPath).size;
+  const installedSize = fs.existsSync(installedPath)
+    ? fs.statSync(installedPath).size
+    : -1;
+
+  if (bundledSize !== installedSize) {
+    fs.copyFileSync(bundledPath, installedPath);
+    mlog(`✅ Installed bundled runtime: ${binaryName}`);
+  }
+
+  if (process.platform !== "win32") fs.chmodSync(installedPath, "755");
+}
+
 // ✅ APP VERSION & BUILD ID - Used to trigger re-download when DMG is updated
-const APP_VERSION = "0.2.1";
+const APP_VERSION = app.getVersion();
 
 // Build ID is auto-generated at build time - forces re-download on every new DMG
 function getBuildId() {
@@ -178,7 +205,7 @@ function getBuildId() {
   } catch (e) {
     mlog("Could not read build ID:", e.message);
   }
-  return "unknown";
+  return APP_VERSION;
 }
 
 const BUILD_ID = getBuildId();
@@ -298,15 +325,21 @@ function resolveFfmpegPath() {
 
 // ✅ CHECK RESOURCES - with file size validation
 async function checkResources() {
+  const backendDetectionEnabled = process.env.BACKEND_DETECTION_ENABLED === "true";
+
   // Backend models (downloaded to userData/models/, used by the Node backend)
-  const REQUIRED_MODELS = [
+  const REQUIRED_MODELS = backendDetectionEnabled ? [
     { name: "best.onnx", minSize: 130000000, type: "backend_model" },           // ~131MB
     { name: "best_s.onnx", minSize: 120000000, type: "backend_model" },         // ~123MB
     { name: "weapons.onnx", minSize: 130000000, type: "backend_model" },        // ~131MB
     { name: "depth_anything_v2_small.onnx", minSize: 98000000, type: "backend_model" }, // ~99MB
     { name: "yolov11n_bestFire.onnx", minSize: 9000000, type: "frontend_model" },  // ~10MB
     { name: "weapons_yolo.onnx", minSize: 11000000, type: "frontend_model" }        // ~12MB
-  ];
+  ] : [];
+
+  if (!backendDetectionEnabled) {
+    mlog("ℹ️ Backend detection disabled; frontend models are bundled with the app");
+  }
 
   // Also check for mediamtx binary (ffmpeg is bundled with the app)
   const mediamtxName = process.platform === "win32" ? "mediamtx.exe" : "mediamtx";
@@ -684,7 +717,9 @@ function startBackend() {
     // DIRECTORY OVERRIDES
     MODELS_DIR_OVERRIDE: modelsPath,
     MEDIAMTX_DIR_OVERRIDE: backendRootPath,
-    FFMPEG_BIN: resolvedFfmpeg.path
+    FFMPEG_BIN: resolvedFfmpeg.path,
+    DATA_DIR_OVERRIDE: path.join(userDataPath, "data"),
+    STORAGE_MODE: process.env.STORAGE_MODE || (isDev ? "dynamodb" : "local")
   };
 
   // ✅ CLEANUP: Kill any zombie process on port 4000 before starting
@@ -795,6 +830,15 @@ function validateDependencies() {
 app.whenReady().then(async () => {
   // 0. Check if version changed - clear old models if so
   const versionChanged = checkVersionAndClearIfNeeded();
+
+  try {
+    installBundledRuntime();
+  } catch (error) {
+    mlog("❌ Runtime installation failed:", error.message);
+    dialog.showErrorBox("FireAI Setup Error", error.message);
+    app.quit();
+    return;
+  }
 
   // 1. Check & Download Resources
   const missing = await checkResources();

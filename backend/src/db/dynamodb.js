@@ -1,8 +1,10 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, DeleteCommand, QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import pino from "pino";
+import { localStore } from "./localStore.js";
 
 const log = pino({ name: "dynamodb" });
+const useLocalStore = process.env.STORAGE_MODE === "local";
 
 // Create DynamoDB client
 const client = new DynamoDBClient({
@@ -27,6 +29,7 @@ const USERS_TABLE = process.env.DYNAMODB_USERS_TABLE || "FireWatch-Users";
  * Get user settings (including sampling rate)
  */
 export async function getUser(userId) {
+  if (useLocalStore) return localStore.getUser(userId);
   try {
     const result = await docClient.send(new GetCommand({
       TableName: USERS_TABLE,
@@ -44,6 +47,7 @@ export async function getUser(userId) {
  * Create user with default settings
  */
 export async function createUser(userId, defaultSamplingRate = 30000) {
+  if (useLocalStore) return localStore.createUser(userId, defaultSamplingRate);
   const item = {
     userId,
     samplingRate: defaultSamplingRate,
@@ -69,6 +73,7 @@ export async function createUser(userId, defaultSamplingRate = 30000) {
  * Get user or create if doesn't exist (ensures user always exists)
  */
 export async function ensureUser(userId, defaultSamplingRate = 30000) {
+  if (useLocalStore) return localStore.ensureUser(userId, defaultSamplingRate);
   try {
     let user = await getUser(userId);
 
@@ -90,6 +95,7 @@ export async function ensureUser(userId, defaultSamplingRate = 30000) {
  * Update user sampling rate
  */
 export async function updateUserSamplingRate(userId, samplingRate) {
+  if (useLocalStore) return localStore.updateUserSamplingRate(userId, samplingRate);
   try {
     const result = await docClient.send(new UpdateCommand({
       TableName: USERS_TABLE,
@@ -114,6 +120,7 @@ export async function updateUserSamplingRate(userId, samplingRate) {
  * Get user's sampling rate (returns default if user doesn't exist)
  */
 export async function getUserSamplingRate(userId, defaultSamplingRate = 30000) {
+  if (useLocalStore) return localStore.getUserSamplingRate(userId, defaultSamplingRate);
   try {
     const user = await getUser(userId);
     return user?.samplingRate || defaultSamplingRate;
@@ -139,6 +146,7 @@ async function getNextCameraId(userId) {
  * Create a new camera
  */
 export async function createCamera(userId, cameraData) {
+  if (useLocalStore) return localStore.createCamera(userId, cameraData);
   const id = await getNextCameraId(userId);
   
   const item = {
@@ -167,6 +175,7 @@ export async function createCamera(userId, cameraData) {
  * Get all cameras for a user
  */
 export async function getCamerasByUserId(userId) {
+  if (useLocalStore) return localStore.getCamerasByUserId(userId);
   try {
     const result = await docClient.send(new QueryCommand({
       TableName: CAMERAS_TABLE,
@@ -188,6 +197,7 @@ export async function getCamerasByUserId(userId) {
  * Get single camera
  */
 export async function getCamera(userId, id) {
+  if (useLocalStore) return localStore.getCamera(userId, id);
   try {
     const result = await docClient.send(new GetCommand({
       TableName: CAMERAS_TABLE,
@@ -209,6 +219,7 @@ export async function getCamera(userId, id) {
  * Update camera
  */
 export async function updateCamera(userId, id, updates) {
+  if (useLocalStore) return localStore.updateCamera(userId, id, updates);
   try {
     // Build update expression
     const updateExpressions = [];
@@ -250,6 +261,7 @@ export async function updateCamera(userId, id, updates) {
  * Delete camera
  */
 export async function deleteCamera(userId, id) {
+  if (useLocalStore) return localStore.deleteCamera(userId, id);
   try {
     await docClient.send(new DeleteCommand({
       TableName: CAMERAS_TABLE,
@@ -271,6 +283,7 @@ export async function deleteCamera(userId, id) {
  * Get active cameras for a user
  */
 export async function getActiveCameras(userId) {
+  if (useLocalStore) return localStore.getActiveCameras(userId);
   try {
     const result = await docClient.send(new QueryCommand({
       TableName: CAMERAS_TABLE,
@@ -294,6 +307,7 @@ export async function getActiveCameras(userId) {
  * Get cameras by IDs
  */
 export async function getCamerasByIds(userId, cameraIds) {
+  if (useLocalStore) return localStore.getCamerasByIds(userId, cameraIds);
   try {
     const cameras = [];
     

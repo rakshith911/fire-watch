@@ -69,7 +69,9 @@ export const cfg = {
   backendDetectionEnabled: process.env.BACKEND_DETECTION_ENABLED === "true",
 };
 
-console.log("✅ Config loaded - DynamoDB mode (no local database)");
+console.log(
+  `✅ Config loaded - ${process.env.STORAGE_MODE === "local" ? "local storage" : "DynamoDB"} mode`
+);
 console.log("🔥 Fire Endpoint:", cfg.fireEndpoint);
 console.log("🎥 Backend detection auto-start:", cfg.backendDetectionEnabled ? "enabled" : "disabled");
 

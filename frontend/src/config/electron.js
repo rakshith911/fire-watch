@@ -7,14 +7,14 @@ export const getBackendUrl = () => {
   if (isElectron()) {
     return "http://localhost:4000"; // Backend runs locally in Electron
   }
-  return process.env.VITE_BACKEND_URL || "http://localhost:4000";
+  return import.meta.env.VITE_API_BASE || "http://localhost:4000";
 };
 
 export const getWebSocketUrl = () => {
   if (isElectron()) {
     return "ws://localhost:4000"; // WebSocket runs locally in Electron
   }
-  return process.env.VITE_WS_URL || "ws://localhost:4000";
+  return import.meta.env.VITE_WS_URL || "ws://localhost:4000";
 };
 
 export const getMediaMTXUrl = (webrtcBase) => {

@@ -1,0 +1,80 @@
+name: Build public beta installers
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            os: macos-15
+            platform_args: --mac dmg --arm64
+            artifact_name: FireAI-macOS-Apple-Silicon
+            artifact_path: frontend/dist-electron/*.dmg
+          - name: macOS Intel
+            os: macos-15-intel
+            platform_args: --mac dmg --x64
+            artifact_name: FireAI-macOS-Intel
+            artifact_path: frontend/dist-electron/*.dmg
+          - name: Windows x64
+            os: windows-latest
+            platform_args: --win nsis --x64
+            artifact_name: FireAI-Windows-x64
+            artifact_path: frontend/dist-electron/*.exe
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci --omit=dev
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Prepare runtime assets
+        working-directory: frontend
+        run: npm run prepare-runtime
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Build installer
+        working-directory: frontend
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder ${{ matrix.platform_args }} --publish=never
+
+      - name: Verify packaged environment
+        working-directory: frontend
+        run: node scripts/verify-public-package.mjs
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14

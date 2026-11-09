@@ -4,6 +4,7 @@ backend/node_modules
 CLAUDE.md
 frontend/dist/
 frontend/dist-electron/
+frontend/build/
 sample_sns.py
 backend/models/*.onnx
 backend/.env

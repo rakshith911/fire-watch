@@ -36,7 +36,15 @@ try {
   });
   console.log("✅ Backend dependencies installed");
 
-  // Step 3: Build Electron app
+  // Step 3: Download the platform-specific MediaMTX binary from its public release.
+  console.log("📦 Preparing runtime assets...");
+  execSync("npm run prepare-runtime", {
+    stdio: "inherit",
+    cwd: path.join(__dirname, ".."),
+  });
+  console.log("✅ Runtime assets prepared");
+
+  // Step 4: Build Electron app
   console.log("📦 Building Electron app...");
   execSync("electron-builder --publish=never", {
     stdio: "inherit",

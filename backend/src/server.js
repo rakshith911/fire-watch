@@ -358,6 +358,11 @@ app.get("*", (req, res) => {
 // 🔍 Model Diagnostics - Check all required models at startup
 // -------------------------------------------------------------------
 function checkModelsAtStartup() {
+  if (!cfg.backendDetectionEnabled) {
+    log.info("ℹ️ Backend detection disabled; skipping backend model diagnostics");
+    return { allPresent: true, modelStatus: [], modelsDir: null };
+  }
+
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
   const modelsDir = process.env.MODELS_DIR_OVERRIDE

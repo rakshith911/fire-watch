@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "electron": "electron .",
     "electron-dev": "concurrently \"npm run dev\" \"wait-on http://localhost:5173 && electron .\"",
-    "electron-pack": "npm run build && electron-builder",
+    "prepare-runtime": "node scripts/prepare-runtime-assets.mjs",
+    "electron-pack": "npm run prepare-runtime && npm run build && electron-builder",
     "dist": "node scripts/build-electron.js",
     "download-models": "node ../backend/scripts/download-models.js",
     "generate-build-id": "node scripts/generate-build-id.cjs",
@@ -62,6 +63,8 @@
         "to": "backend",
         "filter": [
           "**/*",
+          "!.env",
+          "!env",
           "!node_modules/**/*",
           "!models/**/*",
           "!mediamtx",
@@ -69,8 +72,12 @@
         ]
       },
       {
-        "from": "../backend/.env",
+        "from": "../backend/public.env",
         "to": "backend/.env"
+      },
+      {
+        "from": "build/runtime",
+        "to": "runtime"
       },
       {
         "from": "../backend/node_modules",

@@ -30,7 +30,8 @@ export async function initWebSocket(onFireDetection) {
     const baseWsUrl = getWebSocketUrl();
     const wsUrl = `${baseWsUrl}?token=${token}`;
 
-    console.log("🌐 Connecting to WebSocket:", wsUrl);
+    // Never log the query string because it contains the Cognito ID token.
+    console.log("🌐 Connecting to WebSocket:", baseWsUrl);
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => console.log("✅ WebSocket connected");
